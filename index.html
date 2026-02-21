@@ -1108,7 +1108,9 @@ function calcEquityVsRange(handCards, villainRange) {
   return count > 0 ? Math.round((totalEquity / count) * 1000) / 10 : 50;
 }
 
-// ============================================================
+// POST-DRAW ENGINE: See badugi-solver-v2.jsx for post-draw betting logic
+// POST-DRAW ENGINE: See badugi-solver-v2.jsx for post-draw betting logic
+
 // BB CONVERSION — display EV as big blind profit
 // ============================================================
 // The fold baseline varies by position because position affects EV.
@@ -2967,7 +2969,8 @@ export default function BadugiSolver() {
                 </div>
               )}
 
-              {/* Completion state */}
+
+              {/* Action Complete */}
               {isComplete && actionHistory.length > 0 && (
                 <div style={{
                   padding: "20px", textAlign: "center", background: "#f0fdf4",
@@ -3462,6 +3465,7 @@ export default function BadugiSolver() {
     </div>
   );
 }
+
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<BadugiSolver />);

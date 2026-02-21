@@ -1,0 +1,2797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Badugi 6-Max Limit Solver</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; }
+    #root { min-height: 100vh; }
+  </style>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback } = React;
+
+// ============================================================
+// BADUGI 6-MAX LIMIT SOLVER — Pre-First Draw
+// ============================================================
+// Principles:
+// - Best hand: A-2-3-4 rainbow (all different suits)
+// - Tri-cards ranked by highest card (lower = better)
+// - Strong 2-card draws (A-2, A-3) can be better than weak tri-cards
+// - Q/K-high tris have poor showdown value AND poor blocker value
+// - Drawing 2 from strong base gives flexibility + better bluffability
+// ============================================================
+
+const SUITS = ["s", "c", "d", "h"];
+const SUIT_SYMBOLS = { s: "♠", c: "♣", d: "♦", h: "♥" };
+const SUIT_COLORS = { s: "#1a1a2e", c: "#16a34a", d: "#dc2626", h: "#dc2626" };
+const RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"];
+const RANK_VALUES = { A: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9, T: 10, J: 11, Q: 12, K: 13 };
+
+const POSITIONS = ["UTG", "HJ", "CO", "BTN", "SB", "BB"];
+const POSITION_COLORS = {
+  UTG: "#ef4444", HJ: "#f97316", CO: "#eab308",
+  BTN: "#22c55e", SB: "#3b82f6", BB: "#8b5cf6"
+};
+
+// ============================================================
+// HAND CLASSIFICATION
+// ============================================================
+
+function classifyHand(cards) {
+  // cards: array of {rank, suit} objects (4 cards)
+  const suits = cards.map(c => c.suit);
+  const ranks = cards.map(c => c.rank);
+  const uniqueSuits = new Set(suits);
+  const uniqueRanks = new Set(ranks);
+
+  // Find best badugi subset
+  if (uniqueSuits.size === 4 && uniqueRanks.size === 4) {
+    const sorted = [...cards].sort((a, b) => RANK_VALUES[a.rank] - RANK_VALUES[b.rank]);
+    return {
+      type: "pat",
+      label: "Pat Hand (Badugi)",
+      cards: sorted,
+      highCard: sorted[3].rank,
+      strength: sorted.map(c => RANK_VALUES[c.rank]).reduce((a, v, i) => a + v * Math.pow(14, 3 - i), 0)
+    };
+  }
+
+  // Find best 3-card badugi subset (tri-card)
+  const triCombos = [];
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      for (let k = j + 1; k < 4; k++) {
+        const tri = [cards[i], cards[j], cards[k]];
+        const triSuits = new Set(tri.map(c => c.suit));
+        const triRanks = new Set(tri.map(c => c.rank));
+        if (triSuits.size === 3 && triRanks.size === 3) {
+          const sorted = [...tri].sort((a, b) => RANK_VALUES[a.rank] - RANK_VALUES[b.rank]);
+          triCombos.push({
+            cards: sorted,
+            highCard: sorted[2].rank,
+            strength: sorted.map(c => RANK_VALUES[c.rank]).reduce((a, v, i) => a + v * Math.pow(14, 2 - i), 0)
+          });
+        }
+      }
+    }
+  }
+
+  if (triCombos.length > 0) {
+    triCombos.sort((a, b) => a.strength - b.strength);
+    const best = triCombos[0];
+    return {
+      type: "tri",
+      label: `Tri-Card (${best.highCard}-high)`,
+      cards: best.cards,
+      highCard: best.highCard,
+      strength: best.strength,
+      allTris: triCombos
+    };
+  }
+
+  // Find best 2-card subset
+  const twoCombos = [];
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      const two = [cards[i], cards[j]];
+      if (two[0].suit !== two[1].suit && two[0].rank !== two[1].rank) {
+        const sorted = [...two].sort((a, b) => RANK_VALUES[a.rank] - RANK_VALUES[b.rank]);
+        twoCombos.push({
+          cards: sorted,
+          highCard: sorted[1].rank,
+          strength: sorted.map(c => RANK_VALUES[c.rank]).reduce((a, v, i) => a + v * Math.pow(14, 1 - i), 0)
+        });
+      }
+    }
+  }
+
+  if (twoCombos.length > 0) {
+    twoCombos.sort((a, b) => a.strength - b.strength);
+    const best = twoCombos[0];
+    return {
+      type: "two",
+      label: `Two-Card (${best.cards.map(c => c.rank).join("-")})`,
+      cards: best.cards,
+      highCard: best.highCard,
+      strength: best.strength
+    };
+  }
+
+  return { type: "one", label: "One-Card", cards: [cards[0]], highCard: cards[0].rank, strength: 999 };
+}
+
+// ============================================================
+// DRAW PLAN — determines if a tri should be broken to draw 2
+// A "tri-card" is ONLY a tri-card if you plan to draw 1.
+// If you break it to draw 2, it's effectively a two-card hand.
+// ============================================================
+
+function getDrawPlan(cards) {
+  const structural = classifyHand(cards);
+
+  if (structural.type !== "tri") {
+    // Pat hands stay pat, two-card hands draw 2 — no decision needed
+    return {
+      ...structural,
+      drawCount: structural.type === "pat" ? 0 : structural.type === "two" ? 2 : 3,
+      effectiveType: structural.type,
+      keptCards: structural.cards,
+      broke: false
+    };
+  }
+
+  // It's structurally a tri. Should we keep it (draw 1) or break it (draw 2)?
+  const triHighVal = RANK_VALUES[structural.highCard];
+  const triCards = structural.cards; // sorted low to high
+
+  // Find the best 2-card base from ALL 4 cards
+  const twoCombos = [];
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      const two = [cards[i], cards[j]];
+      if (two[0].suit !== two[1].suit && two[0].rank !== two[1].rank) {
+        const sorted = [...two].sort((a, b) => RANK_VALUES[a.rank] - RANK_VALUES[b.rank]);
+        const baseHigh = RANK_VALUES[sorted[1].rank];
+        twoCombos.push({ cards: sorted, highVal: baseHigh, strength: sorted.map(c => RANK_VALUES[c.rank]).reduce((a, v, i) => a + v * Math.pow(14, 1 - i), 0) });
+      }
+    }
+  }
+  twoCombos.sort((a, b) => a.strength - b.strength);
+  const bestTwo = twoCombos[0];
+
+  // Decision: break the tri if:
+  // 1. Tri is Q-high or K-high (weak showdown, poor blockers)
+  // 2. AND the 2-card base is strong (both cards ≤ 5)
+  // 3. OR tri is K-high and base has at least one card ≤ 3
+  const shouldBreak =
+    (triHighVal >= 12 && bestTwo && bestTwo.highVal <= 5) ||  // Q/K tri + strong base
+    (triHighVal >= 13 && bestTwo && bestTwo.highVal <= 7);    // K tri + decent base
+
+  if (shouldBreak && bestTwo) {
+    return {
+      ...structural,
+      drawCount: 2,
+      effectiveType: "two",
+      keptCards: bestTwo.cards,
+      broke: true,
+      brokeFrom: `${structural.highCard}-high tri`,
+      label: `Break Tri → Draw 2 (${bestTwo.cards.map(c => c.rank).join("-")} base)`,
+      // Override strength to use two-card strength for comparisons
+      effectiveStrength: bestTwo.strength
+    };
+  }
+
+  // Keep the tri, draw 1
+  return {
+    ...structural,
+    drawCount: 1,
+    effectiveType: "tri",
+    keptCards: triCards,
+    broke: false,
+    label: `Tri-Card (${structural.highCard}-high) — Draw 1`
+  };
+}
+
+// ============================================================
+// EV CALCULATION ENGINE
+// ============================================================
+
+function calcCompletionProb(hand, draws) {
+  if (hand.type === "pat") return { prob: 1.0, avgQuality: hand.strength };
+
+  if (hand.type === "tri") {
+    const usedSuits = new Set(hand.cards.map(c => c.suit));
+    const missingSuit = SUITS.find(s => !usedSuits.has(s));
+    const usedRanks = new Set(hand.cards.map(c => RANK_VALUES[c.rank]));
+    const outs = RANKS.filter(r => !usedRanks.has(RANK_VALUES[r])).length;
+    const deckSize = 48;
+
+    let missProb = 1;
+    for (let d = 0; d < draws; d++) {
+      missProb *= (deckSize - outs) / (deckSize - d);
+    }
+    return {
+      prob: 1 - missProb,
+      outs,
+      drawsNeeded: 1,
+      avgQuality: hand.strength * 0.6
+    };
+  }
+
+  if (hand.type === "two") {
+    // Drawing 2: complex path
+    // ~10% direct badugi per draw-2 attempt
+    // ~60% make tri per draw-2 attempt, then ~20% per subsequent draw-1
+    const directBadugiRate = 0.0975;
+    const makeTriRate = 0.60;
+    const triCompletionRate = 0.208;
+
+    if (draws === 3) {
+      // Draw 1: 10% badugi, 60% tri, 30% stay two-card
+      // If tri after draw 1: 2 more draws at ~20% each = ~37.6% completion
+      // If two-card after draw 1: draw 2 again, etc.
+      const d1Badugi = directBadugiRate;
+      const d1Tri = makeTriRate * (1 - directBadugiRate);
+      const d1TwoCard = 1 - d1Badugi - d1Tri;
+
+      const triOver2 = 1 - Math.pow(1 - triCompletionRate, 2);
+      const d2Badugi = directBadugiRate;
+      const d2Tri = makeTriRate * (1 - d2Badugi);
+
+      const prob = d1Badugi +
+        d1Tri * triOver2 +
+        d1TwoCard * (d2Badugi + d2Tri * triCompletionRate);
+
+      return { prob: Math.min(prob, 0.95), drawsNeeded: 2, avgQuality: hand.strength * 0.5 };
+    }
+    if (draws === 2) {
+      const prob = directBadugiRate + makeTriRate * (1 - directBadugiRate) * triCompletionRate;
+      return { prob, drawsNeeded: 2, avgQuality: hand.strength * 0.55 };
+    }
+    return { prob: directBadugiRate, drawsNeeded: 2, avgQuality: hand.strength * 0.6 };
+  }
+
+  return { prob: 0.02, drawsNeeded: 3, avgQuality: 999 };
+}
+
+// Calculate EV including showdown value, blocker effects, draw flexibility
+// IMPORTANT: blockers use ALL 4 cards (even discards block opponents)
+// Uses getDrawPlan to determine effective hand type (tri vs broken-to-two)
+function calcHandEV(cards, position) {
+  const plan = getDrawPlan(cards);
+  // Use effectiveType for EV calc — if we're breaking a tri, treat as two-card
+  const hand = plan.effectiveType === "two" && plan.broke
+    ? { ...plan, type: "two", cards: plan.keptCards, highCard: plan.keptCards[plan.keptCards.length - 1]?.rank }
+    : classifyHand(cards);
+  const completion = calcCompletionProb(hand, 3);
+
+  // Position multiplier (later position = more value)
+  const posMultiplier = { UTG: 0.85, HJ: 0.90, CO: 0.95, BTN: 1.05, SB: 0.88, BB: 0.92 };
+
+  // Base EV from completion probability
+  let ev = completion.prob * 6.0; // pot is ~6 small bets with antes
+
+  // Showdown value / made hand quality
+  if (hand.type === "pat") {
+    // Pat hand EV depends on QUALITY — not all badugis are equal
+    // A-2-3-4 (rankSum=10) is the nuts; T-J-Q-K (rankSum=46) is the worst
+    // Key factors:
+    //   - Lower pat = beats more other badugis at showdown
+    //   - Higher pat = vulnerable to any other badugi + can't improve
+    //   - K-high pats with all high cards: zero snow defense, zero blockers
+    //   - Low-card pats: opponents' draws are less likely to get there
+    const rankSum = hand.cards.reduce((s, c) => s + RANK_VALUES[c.rank], 0);
+    // Scale: rankSum 10 (nuts) → base 9.0, rankSum 46 (worst) → base ~3.6
+    ev = 9.0 - (rankSum - 10) * 0.15;
+  } else if (hand.type === "tri") {
+    const highVal = RANK_VALUES[hand.highCard];
+    // Tri showdown value: A-2-3 tri is decent, Q/K-high tri is near zero
+    const triShowdown = Math.max(0, (11 - highVal) * 0.15);
+    ev += (1 - completion.prob) * triShowdown;
+  } else if (hand.type === "two") {
+    // Two-card hands: flex bonus depends on base quality
+    // A-2 base can make premium tris/badugis; 6-7 base makes weak ones
+    // Per-card bonus mirrors blocker granularity
+    const flexBonus = hand.cards.reduce((sum, c) => {
+      const v = RANK_VALUES[c.rank];
+      if (v <= 2) return sum + 0.45;  // A, 2 — premium draw bases
+      if (v <= 3) return sum + 0.35;  // 3 — strong
+      if (v <= 5) return sum + 0.25;  // 4, 5 — good
+      return sum + 0.05;              // 6+ — weak draw bases
+    }, 0);
+    ev += flexBonus;
+  }
+
+  // Blocker value: ALL 4 cards count, not just the badugi subset
+  // Even discarded cards block opponents from holding them
+  // Each rank gets a unique blocker value — lower = better
+  const blockerValue = cards.reduce((sum, c) => {
+    const v = RANK_VALUES[c.rank];
+    if (v === 1) return sum + 0.30;  // A — premium blocker
+    if (v === 2) return sum + 0.26;  // 2 — near-premium
+    if (v === 3) return sum + 0.22;  // 3 — strong
+    if (v === 4) return sum + 0.16;  // 4 — good
+    if (v === 5) return sum + 0.11;  // 5 — decent
+    if (v === 6) return sum + 0.04;  // 6 — minimal
+    if (v === 7) return sum + 0.01;  // 7 — barely useful
+    if (v <= 9) return sum - 0.02;   // 8, 9 — slightly negative
+    return sum - 0.06;               // T, J, Q, K — bad blockers
+  }, 0);
+  ev += blockerValue;
+
+  // Snow/bluff info value: knowing you hold low cards helps snow decisions
+  // If you hold 3s4s and discard them, you know opponents can't have THOSE specific cards
+  const discardedCards = cards.filter(c => !hand.cards.some(hc => hc.rank === c.rank && hc.suit === c.suit));
+  const infoValue = discardedCards.reduce((sum, c) => {
+    const v = RANK_VALUES[c.rank];
+    return sum + (v <= 5 ? 0.1 : 0.0); // low discards give useful info for snowing
+  }, 0);
+  ev += infoValue;
+
+  // Bluffability: can we credibly represent a pat hand later?
+  // High cards in the KEPT portion of the hand hurt bluffability
+  const highCards = hand.cards.filter(c => RANK_VALUES[c.rank] >= 10).length;
+  const bluffPenalty = highCards * 0.15;
+  ev -= bluffPenalty;
+
+  ev *= posMultiplier[position] || 1.0;
+
+  return {
+    ev: Math.round(ev * 100) / 100,
+    hand,
+    plan,
+    completion,
+    blockerValue: Math.round(blockerValue * 100) / 100,
+    infoValue: Math.round(infoValue * 100) / 100,
+    bluffPenalty: Math.round(bluffPenalty * 100) / 100
+  };
+}
+
+// ============================================================
+// HAND CATEGORIES & RANGES
+// ============================================================
+
+// Hands ordered WORST FIRST → BEST LAST
+// Threshold is now POSITION-DEPENDENT (see POSITION_THRESHOLDS below)
+const EXAMPLE_HANDS = {
+  pat: [
+    { name: "3-5-9-K", id: "pat_K", cards: [{ rank: "3", suit: "s" }, { rank: "5", suit: "c" }, { rank: "9", suit: "d" }, { rank: "K", suit: "h" }] },
+    { name: "A-3-7-J", id: "pat_J", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "c" }, { rank: "7", suit: "d" }, { rank: "J", suit: "h" }] },
+    { name: "2-3-6-T", id: "pat_T", cards: [{ rank: "2", suit: "s" }, { rank: "3", suit: "c" }, { rank: "6", suit: "d" }, { rank: "T", suit: "h" }] },
+    { name: "A-2-5-8", id: "pat_8", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "5", suit: "d" }, { rank: "8", suit: "h" }] },
+    { name: "A-2-3-7", id: "pat_7", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "7", suit: "h" }] },
+    { name: "A-2-3-4 (Nut Badugi)", id: "pat_4", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "4", suit: "h" }] },
+  ],
+  // TRI-CARDS: Only hands where you KEEP all 3 and draw 1
+  // No Q-high or K-high tris here — those break to draw 2
+  tri: [
+    { name: "A-2-Jr", id: "tri_J_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "J", suit: "d" }, { rank: "8", suit: "s" }] },
+    { name: "2-3-Tr", id: "tri_T_23", cards: [{ rank: "2", suit: "s" }, { rank: "3", suit: "c" }, { rank: "T", suit: "d" }, { rank: "K", suit: "s" }] },
+    { name: "A-2-9r", id: "tri_9_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "9", suit: "d" }, { rank: "J", suit: "s" }] },
+    { name: "2-4-8r", id: "tri_8_24", cards: [{ rank: "2", suit: "s" }, { rank: "4", suit: "c" }, { rank: "8", suit: "d" }, { rank: "K", suit: "c" }] },
+    { name: "A-2-8r", id: "tri_8_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "8", suit: "d" }, { rank: "Q", suit: "s" }] },
+    { name: "A-2-7r", id: "tri_7_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "7", suit: "d" }, { rank: "K", suit: "c" }] },
+    { name: "7-6-5r", id: "tri_7_65", cards: [{ rank: "7", suit: "s" }, { rank: "6", suit: "c" }, { rank: "5", suit: "d" }, { rank: "K", suit: "s" }] },
+    { name: "3-5-8r", id: "tri_8_35", cards: [{ rank: "3", suit: "s" }, { rank: "5", suit: "c" }, { rank: "8", suit: "d" }, { rank: "J", suit: "s" }] },
+    { name: "A-2-5r", id: "tri_5_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "5", suit: "d" }, { rank: "9", suit: "s" }] },
+    { name: "A-3-4r", id: "tri_4_A3", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "c" }, { rank: "4", suit: "d" }, { rank: "J", suit: "s" }] },
+    { name: "A-2-3r (Best Tri)", id: "tri_3_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "5", suit: "s" }] },
+  ],
+  // TWO-CARDS: Pure two-card draws AND broken tris (Q/K-high with strong base)
+  two: [
+    { name: "3-5", id: "two_35", cards: [{ rank: "3", suit: "s" }, { rank: "5", suit: "c" }, { rank: "J", suit: "s" }, { rank: "T", suit: "c" }] },
+    { name: "A-7", id: "two_A7", cards: [{ rank: "A", suit: "s" }, { rank: "7", suit: "c" }, { rank: "K", suit: "s" }, { rank: "Q", suit: "c" }] },
+    { name: "A-4-Kr → A-4", id: "two_A4K", cards: [{ rank: "A", suit: "s" }, { rank: "4", suit: "c" }, { rank: "K", suit: "d" }, { rank: "J", suit: "s" }] },
+    { name: "A-3-Qr → A-3", id: "two_A3Q", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "c" }, { rank: "Q", suit: "d" }, { rank: "7", suit: "s" }] },
+    { name: "A-2-Kr → A-2", id: "two_A2K", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "K", suit: "d" }, { rank: "9", suit: "s" }] },
+    { name: "A-2-Qr → A-2", id: "two_A2Q", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "Q", suit: "d" }, { rank: "J", suit: "s" }] },
+    { name: "2-3", id: "two_23", cards: [{ rank: "2", suit: "s" }, { rank: "3", suit: "c" }, { rank: "J", suit: "s" }, { rank: "T", suit: "c" }] },
+    { name: "A-4", id: "two_A4", cards: [{ rank: "A", suit: "s" }, { rank: "4", suit: "c" }, { rank: "Q", suit: "s" }, { rank: "9", suit: "c" }] },
+    { name: "A-3", id: "two_A3", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "c" }, { rank: "J", suit: "s" }, { rank: "K", suit: "c" }] },
+    { name: "A-2 (Best 2-Card)", id: "two_A2", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "Q", suit: "s" }, { rank: "K", suit: "c" }] },
+  ]
+};
+
+// Position-specific thresholds: the ID of the WORST hand that's still an open/raise
+// Hands at or better (later in the list) than this are opens
+// Hands worse (earlier in the list) are folds or mixes
+const POSITION_THRESHOLDS = {
+  pat: {
+    UTG: "pat_K",  // All pat hands open from every position
+    HJ: "pat_K",
+    CO: "pat_K",
+    BTN: "pat_K",
+    SB: "pat_K",
+    BB: "pat_K",
+  },
+  // Tri thresholds: only draw-1 hands (J-high is now the weakest tri)
+  tri: {
+    UTG: "tri_9_A2",   // UTG opens ~9-high tris and better
+    HJ: "tri_J_A2",    // HJ opens J-high and better (J is now the weakest tri)
+    CO: "tri_J_A2",    // CO opens J-high and better
+    BTN: "tri_J_A2",   // BTN opens all tris (J-high is the worst tri that exists)
+    SB: "tri_8_A2",    // SB tighter (OOP), opens 8-high and better
+    BB: "tri_J_A2",    // BB defends all tris
+  },
+  // Two-card thresholds: includes broken tris
+  two: {
+    UTG: "two_A2Q",    // UTG opens A-2 draws (including broken A-2-Qr)
+    HJ: "two_A2K",     // HJ adds broken A-2-Kr
+    CO: "two_A3Q",     // CO opens broken A-3-Qr and better
+    BTN: "two_A4K",    // BTN opens broken A-4-Kr and better
+    SB: "two_A3Q",     // SB tighter OOP
+    BB: "two_A2K",     // BB defends broken A-2 draws and better
+  }
+};
+
+// Pair/suit penalty examples — now comparing SAME penalty type but different card quality
+// Key insight: the SPECIFIC cards you hold matter for blockers and future info
+const PENALTY_EXAMPLES = [
+  {
+    section: "same_penalty",
+    title: "Same Penalty, Different Value: Duplicate Suits with Low vs High Cards",
+    handA: { name: "Ac2s3s4s", cards: [{ rank: "A", suit: "c" }, { rank: "2", suit: "s" }, { rank: "3", suit: "s" }, { rank: "4", suit: "s" }] },
+    handB: { name: "Ac2sKsQs", cards: [{ rank: "A", suit: "c" }, { rank: "2", suit: "s" }, { rank: "K", suit: "s" }, { rank: "Q", suit: "s" }] },
+    explanation: "Both reduce to A-2 two-card (draw 2). But Ac2s3s4s is significantly better: the 3 and 4 block opponents from holding those low cards in their hands, degrading their ranges. You also gain info for snowing (standing pat as a bluff) later — you know 3 and 4 are partially removed. KsQs block nothing useful and give you zero strategic information."
+  },
+  {
+    section: "same_penalty",
+    title: "Paired Low vs Paired High: Both Tri-Cards, Vastly Different Value",
+    handA: { name: "As2c3d3h", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "3", suit: "h" }] },
+    handB: { name: "As2cQdQh", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "Q", suit: "d" }, { rank: "Q", suit: "h" }] },
+    explanation: "As2c3d3h gives you A-2-3 tri (the best tri) — strong showdown, strong draw, and the paired 3s block opponents from having 3s. As2cQdQh gives you A-2-Q tri (weak tri) — poor showdown, and the paired Qs block nothing opponents want."
+  },
+  {
+    section: "same_penalty",
+    title: "Two-Suit Penalty: Low Deadwood vs High Deadwood",
+    handA: { name: "As3d4d5c", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "d" }, { rank: "4", suit: "d" }, { rank: "5", suit: "c" }] },
+    handB: { name: "As3dKdQc", cards: [{ rank: "A", suit: "s" }, { rank: "3", suit: "d" }, { rank: "K", suit: "d" }, { rank: "Q", suit: "c" }] },
+    explanation: "Both have two diamonds. As3d4d5c keeps A-3-5 tri (or A-4-5 tri) and blocks 4 and 5 from opponents. As3dKdQc keeps A-3-Q tri (weak) or A-Q-K tri (terrible). The low deadwood hand has better tri options, better blockers, and better information for future streets."
+  },
+  {
+    section: "clean_vs_dirty",
+    title: "Clean Rainbow vs Duplicate Suit: The Full Penalty",
+    handA: { name: "As2c3d7h", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "7", suit: "h" }] },
+    handB: { name: "As2c3d7d", cards: [{ rank: "A", suit: "s" }, { rank: "2", suit: "c" }, { rank: "3", suit: "d" }, { rank: "7", suit: "d" }] },
+    explanation: "As2c3d7h is a pat 7-high badugi — a made hand. As2c3d7d has two diamonds, reducing it to A-2-3 tri (draw 1) or A-2-7 tri. The duplicate suit costs you an entire hand category."
+  }
+];
+
+// ============================================================
+// POSITION-BASED ACTIONS (Pre-First Draw)
+// ============================================================
+
+// EV-based action thresholds by position
+// Now uses actual EV rather than just high card — accounts for blockers and lower cards
+// Open-raise thresholds by position.
+// EV includes a position multiplier (BTN=1.05, UTG=0.85, etc.), so even weak
+// hands get inflated EVs from BTN. Thresholds must be HIGH enough to filter out
+// junk two-cards (5-6+, 6-7, etc.) and marginal K/Q-high tris.
+// The base EV for any two-card hand starts ~2.25 (completion*pot), so thresholds
+// well above that are needed to keep only premium draw-2 hands.
+// Target open rates aligned with NL Holdem 6-max GTO frequencies:
+//   UTG ~17.6%, HJ ~21.5%, CO ~29.3%, BTN ~43.5%, SB ~33.8%
+// Thresholds calibrated against actual C(52,4)=270,725 hand distribution:
+//   Pat 6.3%, Tri 57.1%, Two 35.5%, Trash 1.1%
+// Rationale: Badugi position dynamics mirror Holdem — each position maximizes
+// profit from opens while other positions respond to prevent exploitation.
+const ACTION_EV_THRESHOLDS = {
+  UTG: { raise: 2.94, mix: 2.76 },
+  HJ:  { raise: 3.01, mix: 2.87 },
+  CO:  { raise: 3.00, mix: 2.83 },
+  BTN: { raise: 3.11, mix: 2.86 },
+  SB:  { raise: 2.86, call: 2.47 },
+  BB:  { raise: 3.00, call: 2.40, mixCall: 2.20 }
+};
+
+function getPositionActions(position, handEV) {
+  const { hand, ev, plan } = handEV;
+  const effectiveType = plan?.effectiveType || hand.type;
+  const t = ACTION_EV_THRESHOLDS[position];
+
+  // SB and BB have call option (not just raise/fold)
+  if (position === "SB") {
+    if (ev >= t.raise) {
+      const detail = effectiveType === "pat" ? "Pat hand — raise despite OOP" : "Strong hand — raise despite OOP";
+      return { action: "RAISE", color: "#22c55e", detail };
+    }
+    if (ev >= t.call) {
+      const detail = effectiveType === "pat" ? "Weak pat — call, can't raise confidently OOP" : "Playable — complete, OOP hurts raise EV";
+      return { action: "CALL", color: "#3b82f6", detail };
+    }
+    return { action: "FOLD", color: "#ef4444", detail: "Fold — OOP with weak hand" };
+  }
+  if (position === "BB") {
+    if (ev >= t.raise) {
+      const detail = effectiveType === "pat" ? "Pat hand — 3-bet for value" : "Strong hand — 3-bet for value";
+      return { action: "RAISE", color: "#22c55e", detail };
+    }
+    if (ev >= t.call) {
+      const detail = effectiveType === "pat" ? "Weak pat — defend, no raise" : "Playable — defend BB";
+      return { action: "CALL", color: "#3b82f6", detail };
+    }
+    if (ev >= t.mixCall) return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: "Marginal — mix defends" };
+    return { action: "FOLD", color: "#ef4444", detail: "Fold — too weak to defend" };
+  }
+
+  // Open-raise positions (UTG, HJ, CO, BTN): raise, mix, or fold
+  // EV already accounts for blockers, lower cards, showdown — not just high card
+  if (ev >= t.raise) {
+    const detail = effectiveType === "pat"
+      ? "Pat hand — open raise for value"
+      : effectiveType === "tri"
+        ? "Tri (draw 1) — EV supports open raise"
+        : plan?.broke
+          ? "Break tri → draw 2 from strong base"
+          : "Two-card draw — EV supports open";
+    return { action: "RAISE", color: "#22c55e", detail };
+  }
+  if (ev >= t.mix) {
+    const detail = effectiveType === "pat"
+      ? "Weak pat — mix raise/fold, poor blockers + snow defense"
+      : effectiveType === "tri"
+        ? "Borderline tri — mix raise/fold based on lower cards"
+        : plan?.broke
+          ? "Broken tri — marginal draw 2"
+          : "Marginal 2-card — sometimes open";
+    return { action: "MIX (Raise/Fold)", color: "#fbbf24", detail };
+  }
+
+  // Below threshold = fold
+  const detail = effectiveType === "pat"
+    ? "Worst pat — no blockers, no snow defense, fold from " + position
+    : effectiveType === "tri"
+      ? "Tri but poor lower cards/blockers — fold from " + position
+      : effectiveType === "two" && plan?.broke
+        ? "Broken tri — too weak to open from " + position
+        : "Too weak from " + position;
+  return { action: "FOLD", color: "#ef4444", detail };
+}
+
+// Facing a raise actions
+// betLevel: 1 = facing an open raise, 2 = facing a 3-bet, 3 = facing a 4-bet
+// callerCount: how many players have already cold-called the raise before us
+//   Each caller represents a range that showed strength by calling — tightens our requirements.
+//   e.g. UTG opens, HJ calls → CO faces betLevel=1 but callerCount=1.
+// The higher the bet level OR the more callers, the tighter your continuing range must be.
+function getFacingRaiseActions(position, openerPos, handEV, betLevel, callerCount) {
+  const bl = betLevel || 1; // default to facing a single raise
+  const callers = callerCount || 0;
+  const { hand, ev, plan } = handEV;
+  const effectiveType = plan?.effectiveType || hand.type;
+  const posIdx = POSITIONS.indexOf(position);
+  const playersBehind = Math.max(0, 5 - posIdx);
+
+  // ── FACING A 4-BET+ (betLevel >= 3): only premium hands continue ──
+  // The 4-bettor's range is extremely strong: top pats + near-nut tri semi-bluffs.
+  // But: (a) premium tris drawing to nuts can continue — they have implied odds + completion equity,
+  //       and (b) mediocre pats that can't break are "zombie hands" — stuck losing to the 4-bet range.
+  if (bl >= 3) {
+    // Pat hands facing 4-bet
+    if (effectiveType === "pat") {
+      if (ev >= 6.5) return { action: `${bl + 2}-BET`, color: "#22c55e", detail: "Nut pat — raise for value" };
+      if (ev >= 5.5) return { action: "CALL", color: "#3b82f6", detail: "Strong pat — call 4-bet" };
+      // Marginal pats (ev 4.5-5.5): these are mediocre badugis that can't improve.
+      // Against a 4-bet range of top pats + nut tri draws, they're often dominated.
+      if (ev >= 4.5) return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: "Mediocre pat vs 4-bet — can't break, often dominated" };
+      return { action: "FOLD", color: "#ef4444", detail: "Weak pat — fold to 4-bet, zombie hand vs premium range" };
+    }
+    // Tri-cards facing 4-bet: near-nut draws can still continue.
+    // A-2-3 draw: completing gives you the 2nd nuts or better. Massive implied odds
+    // in a 4-bet pot, and if you hit, opponent's strong pat may pay you off.
+    // A-2-4 draw: still drawing to a very strong badugi, worth a call.
+    if (effectiveType === "tri") {
+      const triHighVal = RANK_VALUES[hand.highCard];
+      if (triHighVal <= 3) return { action: "CALL", color: "#3b82f6", detail: "Near-nut tri — call 4-bet, drawing to nuts w/ massive implied odds" };
+      if (triHighVal <= 4) return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: "4-high tri — marginal call vs 4-bet, drawing to strong badugi" };
+      return { action: "FOLD", color: "#ef4444", detail: "Fold tri to 4-bet — draw not strong enough vs premium range" };
+    }
+    // Two-cards and everything else: fold
+    return { action: "FOLD", color: "#ef4444", detail: "Fold to 4-bet — only strong pats and nut draws continue" };
+  }
+
+  // ── FACING A 3-BET (betLevel === 2): very tight range ──
+  // You're against the opener's range AND the 3-bettor's premium range.
+  // 3-bettor typically has: premium tris (≤5 high), strong pats.
+  // Cold-calling a 3-bet requires hands that play well against BOTH ranges.
+  if (bl === 2) {
+    // Pat hands facing 3-bet: cold-calling into TWO strong ranges + squeeze risk behind.
+    // A mediocre badugi is a "zombie hand" here — can't break and redraw, stuck losing to
+    // both the opener's continuing range and the 3-bettor's premium range.
+    // Squeeze adjustment: each player behind raises thresholds (they could wake up with a monster).
+    if (effectiveType === "pat") {
+      const squeezeAdj = playersBehind * 0.20;
+      const callThresh = 4.5 + squeezeAdj;   // CO(3 behind)=5.1, BTN(2)=4.9, SB(1)=4.7, BB(0)=4.5
+      const mixThresh = 4.0 + squeezeAdj;     // CO=4.6, BTN=4.4, SB=4.2, BB=4.0
+      // 4-bet threshold: must be confident you're ahead of the 3-bettor's range.
+      // 3-bettor has strong pats + premium tris. Need a genuinely strong badugi.
+      // ev 6.0 ≈ rankSum 30 ≈ 2-6-9-K or better — clear favorite vs 3-bet range.
+      if (ev >= 6.0) return { action: `${bl + 2}-BET`, color: "#22c55e", detail: "Strong pat — 4-bet for value vs 3-bet" };
+      if (ev >= callThresh) return { action: "CALL", color: "#3b82f6", detail: `Solid pat — call 3-bet (threshold ${callThresh.toFixed(1)} w/ ${playersBehind} behind)` };
+      if (ev >= mixThresh) return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal pat vs 3-bet — squeeze risk w/ ${playersBehind} behind` };
+      return { action: "FOLD", color: "#ef4444", detail: "Weak pat — fold to 3-bet, zombie hand vs two strong ranges" };
+    }
+    // Tri-cards facing 3-bet: premium tris continue, near-nut draws can semi-bluff 4-bet
+    // Key insight: 4-betting a premium tri has fold equity vs weak pats that can't break.
+    // UTG's 7-8-9-T badugi opened for value but folds to a 4-bet — stuck hand, no redraw.
+    // Multiway this is amplified: weak pats have poor visibility against multiple strong ranges.
+    if (effectiveType === "tri") {
+      const triHighVal = RANK_VALUES[hand.highCard];
+      // ≤3-high tri (A-2-3 draw): semi-bluff 4-bet at a frequency. Drawing to near-nut badugi
+      // + fold equity vs weak pats that can't break. Best from late position.
+      if (triHighVal <= 3) return { action: `MIX (${bl + 2}-BET/Call)`, color: "#a855f7", detail: "Near-nut tri — semi-bluff 4-bet freq. Fold equity vs weak pats + nut draw equity" };
+      if (triHighVal <= 4) return { action: "CALL", color: "#3b82f6", detail: "Premium tri — call 3-bet (drawing to strong badugi)" };
+      if (triHighVal <= 5 && playersBehind <= 1) return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: "5-high tri — marginal call vs 3-bet, position-dependent" };
+      return { action: "FOLD", color: "#ef4444", detail: `Fold tri to 3-bet — behind both ranges` };
+    }
+    // Two-card hands: always fold to a 3-bet. Drawing 2 against two strong ranges = lighting money on fire.
+    return { action: "FOLD", color: "#ef4444", detail: "Fold 2-card to 3-bet — drawing 2 vs two strong ranges" };
+  }
+
+  // ── FACING A SINGLE RAISE (betLevel === 1): standard facing-raise logic ──
+  // callerCount adjusts thresholds: each caller already showed strength by calling the raise.
+  // Multiway pots require tighter continuing ranges because:
+  //   - More ranges to beat at showdown
+  //   - Your draw equity is diluted (others may complete too)
+  //   - Weak made hands have poor "visibility" — can't see through multiple opponents
+  const callerAdj = callers * 0.5; // each caller tightens thresholds significantly
+
+  // Pat hands vs single raise:
+  // KEY INSIGHT: Flatting a pat makes your hand face-up. Everyone knows you have a mediocre made hand.
+  // All pats that continue should 3-bet — it preserves initiative and hides hand strength.
+  // Only pats with good equity/visibility should continue at all.
+  // Multiway: even worse. Overcalling KQJ8r is lighting money on fire — terrible visibility,
+  // no improvement path, opponents know exactly what you have.
+  if (effectiveType === "pat") {
+    const pat3betThresh = 3.5 + callers * 0.4; // 3.5 heads-up, 3.9 w/ 1 caller, 4.3 w/ 2
+    if (ev >= pat3betThresh) return { action: "3-BET", color: "#22c55e", detail: `Pat — 3-bet (preserves initiative + hides strength)${callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : ""}` };
+    // Marginal pats: 3-bet at a frequency or fold. Never flat — flatting is face-up.
+    if (ev >= pat3betThresh - 0.5) return { action: "MIX (3-BET/Fold)", color: "#fbbf24", detail: `Marginal pat — mix 3-bet/fold, never flat (face-up)${callers ? `, ${callers} in pot` : ""}` };
+    return { action: "FOLD", color: "#ef4444", detail: `Weak pat — fold${callers ? `, multiway too strong` : ""}, no visibility, can't improve` };
+  }
+
+  // Tri-card vs single raise: players behind, callers, AND post-draw playability all matter.
+  //
+  // KEY INSIGHT: A completed 9-high badugi is actually decent at showdown — it beats many badugis.
+  // The problem is the JOURNEY. A 9-high tri facing multiple opponents across 3 drawing rounds:
+  //   - Each draw round: opponents bet, you call while behind (drawing 1)
+  //   - If you miss: you're stuck with a tri, losing to all pats and completed badugis
+  //   - If you hit: your 9-high badugi is fine, but you've already paid 3 streets of multiway bets
+  //   - Opponents with pats bet every street for value; opponents with premium tris draw to better
+  //   - The COST of drawing multiway (facing bets from 2+ opponents per street) overwhelms
+  //     the showdown value of your completion
+  //
+  // So the multiway penalty isn't about completed hand quality — it's about the EV of the
+  // whole drawing process against multiple betting opponents.
+  if (effectiveType === "tri") {
+    const triHighVal = RANK_VALUES[hand.highCard];
+    const triBehind = playersBehind;
+
+    // MULTIWAY DRAWING COST GATE:
+    // With 2+ callers: marginal tris (8+ high) face brutal multi-street action.
+    // You're drawing 1 while paying double/triple bets each street. Even when you hit,
+    // you've invested too many bets to show a profit.
+    if (callers >= 2 && triHighVal >= 8)
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri can't profitably draw vs ${1 + callers} opponents across 3 streets` };
+    // With 1 caller: 9+ high tris struggle. The extra opponent doubles the per-street cost
+    // of drawing while not improving your completion odds.
+    if (callers >= 1 && triHighVal >= 9)
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri, drawing cost too high multiway (facing bets from ${1 + callers} each street)` };
+
+    // Standard threshold logic with caller adjustments
+    const triCallMax = 8 - Math.floor(triBehind * 0.5) - callers;
+    const triMixMax = triCallMax + Math.max(1, 2 - callers);
+
+    if (triHighVal <= 5 && callers === 0)
+      return { action: "3-BET", color: "#22c55e", detail: "Premium tri (draw 1) — 3-bet for value" };
+    if (triHighVal <= 5 && callers >= 1)
+      return { action: "CALL", color: "#3b82f6", detail: `Premium tri — call (3-bet less effective multiway, ${callers} caller${callers > 1 ? "s" : ""})` };
+    if (triHighVal <= triCallMax)
+      return { action: "CALL", color: "#3b82f6", detail: `Good tri — call${callers ? `, tighter w/ ${callers} caller${callers > 1 ? "s" : ""}` : `, ${triBehind} behind`}` };
+    if (triHighVal <= triMixMax)
+      return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Medium tri — ${callers ? `${callers} caller${callers > 1 ? "s" : ""} + ` : ""}${triBehind} behind` };
+    return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold${callers ? `, ${callers} caller${callers > 1 ? "s" : ""} ahead` : `, ${triBehind} behind`}` };
+  }
+
+  // Two-card vs single raise: multiway quality gate + threshold adjustments.
+  // KEY MULTIWAY INSIGHT: it's not just about completion probability — it's about
+  // what you COMPLETE TO. A 3-9 base can at best make a 9-high badugi, which loses
+  // to most of what two strong ranges hold. Drawing 2 to a weak completion multiway
+  // is burning money — you're paying to draw to a hand that's often second-best even when you hit.
+  //
+  // Completed hand quality by base high card:
+  //   A-2 base → completes to A-2-x-y (premium badugi, often best) ✓ multiway
+  //   A-5 base → completes to A-5-x-y (good badugi) ✓ multiway
+  //   3-6 base → completes to at best 3-6-x-y (decent) — marginal multiway
+  //   3-9 base → completes to at best 3-9-x-y (weak) — fold multiway
+  //   5-8 base → completes to at best 5-8-x-y (bad) — always fold multiway
+  if (effectiveType === "two" || (effectiveType === "two" && plan?.broke)) {
+    const baseHighVal = Math.max(...hand.cards.map(c => RANK_VALUES[c.rank]));
+
+    // MULTIWAY QUALITY GATE: with callers in the pot, only premium completions have value.
+    // Each caller makes weak completions more worthless (more ranges to beat at showdown).
+    if (callers >= 1) {
+      // With 1+ callers: base high card 8+ always folds (completing to 8+ badugi = trash multiway)
+      if (baseHighVal >= 8) return { action: "FOLD", color: "#ef4444", detail: `Fold 2-card — ${baseHighVal}-high completion worthless vs ${1 + callers} opponents` };
+      // With 1+ callers: base high card 6-7 only continues with premium lower cards
+      if (baseHighVal >= 6) {
+        // Need very strong lower card (A or 2) to justify multiway with mediocre completion
+        const hasAce = hand.cards.some(c => c.rank === "A");
+        const hasDeuce = hand.cards.some(c => c.rank === "2");
+        if (!hasAce && !hasDeuce) return { action: "FOLD", color: "#ef4444", detail: `Fold — ${baseHighVal}-high base w/o A or 2 too weak multiway` };
+      }
+      // With 2+ callers: even tighter — only A-2 through A-5 bases continue
+      if (callers >= 2 && baseHighVal >= 6) return { action: "FOLD", color: "#ef4444", detail: `Fold — ${baseHighVal}-high base can't beat ${1 + callers} ranges even when completing` };
+    }
+
+    const squeezeAdj = playersBehind * 0.35 + callers * 0.5;
+    const twoCallThreshold = 2.5 + squeezeAdj;
+    const twoMixThreshold = 2.0 + squeezeAdj;
+    const callersNote = callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : "";
+    const behindNote = playersBehind ? `, ${playersBehind} behind` : "";
+
+    if (plan?.broke) {
+      return ev > (twoCallThreshold - 0.2)
+        ? { action: "CALL", color: "#3b82f6", detail: `Broken tri → draw 2${callersNote}${behindNote}` }
+        : { action: "FOLD", color: "#ef4444", detail: `Broken tri — fold${callers ? ", multiway" : ""}${behindNote}` };
+    }
+    if (ev > twoCallThreshold)
+      return { action: "CALL", color: "#3b82f6", detail: `Strong 2-card — call${callersNote || ` (${playersBehind} behind)`}` };
+    if (ev > twoMixThreshold)
+      return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal 2-card${callersNote ? ` —${callersNote}` : ` — ${playersBehind} behind`}` };
+    return { action: "FOLD", color: "#ef4444", detail: `Fold to raise${callers ? " — multiway too strong" : ""}` };
+  }
+  return { action: "FOLD", color: "#ef4444", detail: `Fold to raise${callers ? " — multiway too strong" : ""}` };
+}
+
+// ============================================================
+// EQUITY VS RANGE
+// ============================================================
+
+function calcEquityVsRange(handCards, villainRange) {
+  const heroHand = classifyHand(handCards);
+  const heroCompletion = calcCompletionProb(heroHand, 3);
+  let totalEquity = 0;
+  let count = 0;
+
+  for (const vHand of villainRange) {
+    const vClass = classifyHand(vHand.cards);
+    const vCompletion = calcCompletionProb(vClass, 3);
+
+    // Both complete
+    const bothComplete = heroCompletion.prob * vCompletion.prob;
+    // When both complete, compare badugis (lower = better)
+    const heroAvg = heroCompletion.avgQuality || 50;
+    const vAvg = vCompletion.avgQuality || 50;
+    const heroWinsBoth = heroAvg < vAvg ? 0.65 : heroAvg > vAvg ? 0.35 : 0.5;
+
+    // Hero completes, villain doesn't
+    const heroOnly = heroCompletion.prob * (1 - vCompletion.prob);
+
+    // Villain completes, hero doesn't
+    const vOnly = (1 - heroCompletion.prob) * vCompletion.prob;
+
+    // Neither completes — compare best hands
+    const neither = (1 - heroCompletion.prob) * (1 - vCompletion.prob);
+    let neitherWin = 0.5;
+    if (heroHand.type === "tri" && vClass.type === "tri") {
+      neitherWin = heroHand.strength < vClass.strength ? 0.65 : heroHand.strength > vClass.strength ? 0.35 : 0.5;
+    } else if (heroHand.type === "tri" && vClass.type === "two") {
+      neitherWin = 0.7;
+    } else if (heroHand.type === "two" && vClass.type === "tri") {
+      neitherWin = 0.3;
+    }
+
+    totalEquity += bothComplete * heroWinsBoth + heroOnly * 0.95 + vOnly * 0.05 + neither * neitherWin;
+    count++;
+  }
+
+  return count > 0 ? Math.round((totalEquity / count) * 1000) / 10 : 50;
+}
+
+// ============================================================
+// BB CONVERSION — display EV as big blind profit
+// ============================================================
+// The fold baseline varies by position because position affects EV.
+// Hands above baseline are profitable opens; below are folds.
+// BB profit = (model_EV - baseline) * scale
+
+const FOLD_BASELINES = { UTG: 2.85, HJ: 2.55, CO: 2.25, BTN: 1.85, SB: 2.45, BB: 2.15 };
+
+function toDisplayBB(rawEV, position) {
+  const baseline = FOLD_BASELINES[position] || 2.3;
+  const bb = (rawEV - baseline) * 0.15;
+  return Math.round(bb * 100) / 100;
+}
+
+function formatBB(bbValue) {
+  if (bbValue >= 0) return "+" + bbValue.toFixed(2);
+  return bbValue.toFixed(2);
+}
+
+// ============================================================
+// PAT HAND TABLE: All rank combos grouped by highest card
+// ============================================================
+
+function generatePatRankCombos() {
+  const result = {};
+  const highCards = ["4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"];
+  for (const high of highCards) {
+    const highVal = RANK_VALUES[high];
+    const lowerRanks = RANKS.filter(r => RANK_VALUES[r] < highVal);
+    const combos = [];
+    for (let i = 0; i < lowerRanks.length; i++) {
+      for (let j = i + 1; j < lowerRanks.length; j++) {
+        for (let k = j + 1; k < lowerRanks.length; k++) {
+          combos.push([lowerRanks[i], lowerRanks[j], lowerRanks[k], high]);
+        }
+      }
+    }
+    result[high] = combos;
+  }
+  return result;
+}
+
+function makeRepresentativePatHand(ranks) {
+  const suits = ["s", "c", "d", "h"];
+  return ranks.map((r, i) => ({ rank: r, suit: suits[i] }));
+}
+
+function findWorstProfitablePatOpen(combos, position) {
+  let profitableHands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativePatHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getPositionActions(position, evData);
+    if (action.action !== "FOLD") {
+      profitableHands.push({
+        combo: ranks,
+        ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-") + "r"
+      });
+    }
+  }
+  if (profitableHands.length === 0) return null;
+  profitableHands.sort((a, b) => a.ev - b.ev);
+  return profitableHands[0];
+}
+
+const PAT_RANK_COMBOS = generatePatRankCombos();
+const PAT_HIGH_CARDS = ["4", "5", "6", "7", "8", "9", "T", "J", "Q", "K"];
+
+// ============================================================
+// TRI-CARD TABLE: All rank combos grouped by highest card
+// ============================================================
+
+// Generate all tri-card rank combos grouped by highest card (3 through J)
+// Q/K-high tris break to draw 2, so they don't appear here
+function generateTriRankCombos() {
+  const result = {};
+  const highCards = ["3", "4", "5", "6", "7", "8", "9", "T", "J"];
+  for (const high of highCards) {
+    const highVal = RANK_VALUES[high];
+    const lowerRanks = RANKS.filter(r => RANK_VALUES[r] < highVal);
+    const combos = [];
+    for (let i = 0; i < lowerRanks.length; i++) {
+      for (let j = i + 1; j < lowerRanks.length; j++) {
+        combos.push([lowerRanks[i], lowerRanks[j], high]);
+      }
+    }
+    result[high] = combos;
+  }
+  return result;
+}
+
+// Build a representative 4-card hand from a tri rank combo
+// Assigns 3 different suits, adds high deadwood in a shared suit
+function makeRepresentativeTriHand(ranks) {
+  const suits = ["s", "c", "d"];
+  const triCards = ranks.map((r, i) => ({ rank: r, suit: suits[i] }));
+  // Deadwood: K in first card's suit (typical worst-case scenario)
+  // If first card IS a K, use Q instead
+  const deadRank = ranks.includes("K") ? (ranks.includes("Q") ? "J" : "Q") : "K";
+  const deadwood = { rank: deadRank, suit: "s" };
+  return [...triCards, deadwood];
+}
+
+// For each highest card column and position, find the worst profitable open
+// Returns { combo: [ranks], ev, action } or null if nothing is profitable
+function findWorstProfitableOpen(combos, position) {
+  let profitableHands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativeTriHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getPositionActions(position, evData);
+    if (action.action !== "FOLD") {
+      profitableHands.push({
+        combo: ranks,
+        ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-") + "r"
+      });
+    }
+  }
+  if (profitableHands.length === 0) return null;
+  // Sort by EV ascending — worst profitable is first
+  profitableHands.sort((a, b) => a.ev - b.ev);
+  return profitableHands[0];
+}
+
+const TRI_RANK_COMBOS = generateTriRankCombos();
+const TRI_HIGH_CARDS = ["3", "4", "5", "6", "7", "8", "9", "T", "J"];
+
+// ============================================================
+// TWO-CARD TABLE: All base combos grouped by highest card
+// ============================================================
+
+function generateTwoRankCombos() {
+  const result = {};
+  const highCards = ["2", "3", "4", "5", "6", "7", "8", "9"];
+  for (const high of highCards) {
+    const highVal = RANK_VALUES[high];
+    const lowerRanks = RANKS.filter(r => RANK_VALUES[r] < highVal);
+    const combos = [];
+    for (const low of lowerRanks) {
+      combos.push([low, high]);
+    }
+    result[high] = combos;
+  }
+  return result;
+}
+
+// Build a representative 4-card hand from a two-card base
+// Base cards get different suits; deadwood gets high cards sharing suits
+function makeRepresentativeTwoHand(ranks) {
+  const baseCards = [
+    { rank: ranks[0], suit: "s" },
+    { rank: ranks[1], suit: "c" }
+  ];
+  // Deadwood: highest cards NOT in the base, sharing base suits
+  const usedRanks = new Set(ranks);
+  const deadRanks = RANKS.filter(r => !usedRanks.has(r)).sort((a, b) => RANK_VALUES[b] - RANK_VALUES[a]);
+  const d1 = deadRanks[0] || "K";
+  const d2 = deadRanks[1] || "Q";
+  return [...baseCards, { rank: d1, suit: "s" }, { rank: d2, suit: "c" }];
+}
+
+function findWorstProfitableTwoOpen(combos, position) {
+  let profitableHands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativeTwoHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getPositionActions(position, evData);
+    if (action.action !== "FOLD") {
+      profitableHands.push({
+        combo: ranks,
+        ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-")
+      });
+    }
+  }
+  if (profitableHands.length === 0) return null;
+  profitableHands.sort((a, b) => a.ev - b.ev);
+  return profitableHands[0];
+}
+
+const TWO_RANK_COMBOS = generateTwoRankCombos();
+const TWO_HIGH_CARDS = ["2", "3", "4", "5", "6", "7", "8", "9"];
+
+// ============================================================
+// FACING RAISE TABLE HELPERS — same format but for call/3-bet/fold
+// ============================================================
+
+function findWorstDefendTri(combos, position, openerPos) {
+  let hands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativeTriHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getFacingRaiseActions(position, openerPos, evData);
+    if (action.action !== "FOLD") {
+      hands.push({
+        combo: ranks, ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-") + "r"
+      });
+    }
+  }
+  if (hands.length === 0) return null;
+  hands.sort((a, b) => a.ev - b.ev);
+  return hands[0];
+}
+
+function findWorstDefendPat(combos, position, openerPos) {
+  let hands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativePatHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getFacingRaiseActions(position, openerPos, evData);
+    if (action.action !== "FOLD") {
+      hands.push({
+        combo: ranks, ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-") + "r"
+      });
+    }
+  }
+  if (hands.length === 0) return null;
+  hands.sort((a, b) => a.ev - b.ev);
+  return hands[0];
+}
+
+function findWorstDefendTwo(combos, position, openerPos) {
+  let hands = [];
+  for (const ranks of combos) {
+    const cards = makeRepresentativeTwoHand(ranks);
+    const evData = calcHandEV(cards, position);
+    const action = getFacingRaiseActions(position, openerPos, evData);
+    if (action.action !== "FOLD") {
+      hands.push({
+        combo: ranks, ev: evData.ev,
+        bb: toDisplayBB(evData.ev, position),
+        action: action.action,
+        label: ranks.join("-")
+      });
+    }
+  }
+  if (hands.length === 0) return null;
+  hands.sort((a, b) => a.ev - b.ev);
+  return hands[0];
+}
+
+// ============================================================
+// RANGE STATS — Weighted by dealing frequency
+// ============================================================
+// Each rank combo type represents different numbers of actual dealt hands.
+// Total 4-card hands from 52-card deck: C(52,4) = 270,725
+//
+// Actual distribution (enumerated all 270,725 hands):
+//   Pat (4 unique ranks + 4 unique suits): 17,160 (6.34%)
+//     → 715 rank combos × 24 suit arrangements each
+//   Tri (best 3-card badugi subset):       154,440 (57.05%)
+//     → 286 rank combos × ~540 actual hands each
+//   Two (best 2-card badugi subset):        96,252 (35.55%)
+//     → 78 rank combos × ~1,234 actual hands each
+//   One (no 2-card rainbow base):            2,873 (1.06%)
+//
+// Weights are normalized so PAT_WEIGHT = 1.0 (= 24 actual hands).
+// Each weight unit = 24 actual dealt hands.
+
+const PAT_WEIGHT = 1.0;    // 24 actual hands per rank combo / 24 = 1.0
+const TRI_WEIGHT = 22.5;   // 540 actual hands per rank combo / 24 = 22.5
+const TWO_WEIGHT = 51.4;   // 1234 actual hands per rank combo / 24 = 51.4
+const TRASH_WEIGHT_TOTAL = 120; // 2873 actual one-card hands / 24 = ~120
+
+// Extended tri combos including Q/K (which break to draw 2 in practice)
+const ALL_TRI_HIGH_CARDS = ["3","4","5","6","7","8","9","T","J","Q","K"];
+const ALL_TRI_COMBOS = (() => {
+  const result = {};
+  for (const high of ALL_TRI_HIGH_CARDS) {
+    const highVal = RANK_VALUES[high];
+    const lowerRanks = RANKS.filter(r => RANK_VALUES[r] < highVal);
+    const combos = [];
+    for (let i = 0; i < lowerRanks.length; i++) {
+      for (let j = i + 1; j < lowerRanks.length; j++) {
+        combos.push([lowerRanks[i], lowerRanks[j], high]);
+      }
+    }
+    result[high] = combos;
+  }
+  return result;
+})();
+
+// Extended two-card bases including high bases (T-K) that always fold
+const ALL_TWO_HIGH_CARDS = ["2","3","4","5","6","7","8","9","T","J","Q","K"];
+const ALL_TWO_COMBOS = (() => {
+  const result = {};
+  for (const high of ALL_TWO_HIGH_CARDS) {
+    const highVal = RANK_VALUES[high];
+    const lowerRanks = RANKS.filter(r => RANK_VALUES[r] < highVal);
+    const combos = [];
+    for (const low of lowerRanks) {
+      combos.push([low, high]);
+    }
+    result[high] = combos;
+  }
+  return result;
+})();
+
+function computeWeightedRangeStats() {
+  const stats = {};
+  for (const pos of POSITIONS) {
+    let wRaise = 0, wMix = 0, wCall = 0, wFold = 0;
+    const byType = {
+      pat: { open: 0, fold: 0, total: 0 },
+      tri: { open: 0, fold: 0, total: 0 },
+      two: { open: 0, fold: 0, total: 0 }
+    };
+
+    // Pat hands (all C(13,4) = 715 combos)
+    for (const high of PAT_HIGH_CARDS) {
+      for (const ranks of PAT_RANK_COMBOS[high]) {
+        const cards = makeRepresentativePatHand(ranks);
+        const evData = calcHandEV(cards, pos);
+        const action = getPositionActions(pos, evData);
+        byType.pat.total += PAT_WEIGHT;
+        if (action.action === "RAISE") { wRaise += PAT_WEIGHT; byType.pat.open += PAT_WEIGHT; }
+        else if (action.action.includes("MIX")) { wMix += PAT_WEIGHT; byType.pat.open += PAT_WEIGHT * 0.5; byType.pat.fold += PAT_WEIGHT * 0.5; }
+        else if (action.action === "CALL") { wCall += PAT_WEIGHT; byType.pat.open += PAT_WEIGHT; }
+        else { wFold += PAT_WEIGHT; byType.pat.fold += PAT_WEIGHT; }
+      }
+    }
+
+    // All tri combos including Q/K (286 total, Q/K break to two-card via draw plan)
+    for (const high of ALL_TRI_HIGH_CARDS) {
+      for (const ranks of ALL_TRI_COMBOS[high]) {
+        const cards = makeRepresentativeTriHand(ranks);
+        const evData = calcHandEV(cards, pos);
+        const action = getPositionActions(pos, evData);
+        byType.tri.total += TRI_WEIGHT;
+        if (action.action === "RAISE") { wRaise += TRI_WEIGHT; byType.tri.open += TRI_WEIGHT; }
+        else if (action.action.includes("MIX")) { wMix += TRI_WEIGHT; byType.tri.open += TRI_WEIGHT * 0.5; byType.tri.fold += TRI_WEIGHT * 0.5; }
+        else if (action.action === "CALL") { wCall += TRI_WEIGHT; byType.tri.open += TRI_WEIGHT; }
+        else { wFold += TRI_WEIGHT; byType.tri.fold += TRI_WEIGHT; }
+      }
+    }
+
+    // All two-card bases including high bases T-K (78 total)
+    for (const high of ALL_TWO_HIGH_CARDS) {
+      for (const ranks of ALL_TWO_COMBOS[high]) {
+        const cards = makeRepresentativeTwoHand(ranks);
+        const evData = calcHandEV(cards, pos);
+        const action = getPositionActions(pos, evData);
+        byType.two.total += TWO_WEIGHT;
+        if (action.action === "RAISE") { wRaise += TWO_WEIGHT; byType.two.open += TWO_WEIGHT; }
+        else if (action.action.includes("MIX")) { wMix += TWO_WEIGHT; byType.two.open += TWO_WEIGHT * 0.5; byType.two.fold += TWO_WEIGHT * 0.5; }
+        else if (action.action === "CALL") { wCall += TWO_WEIGHT; byType.two.open += TWO_WEIGHT; }
+        else { wFold += TWO_WEIGHT; byType.two.fold += TWO_WEIGHT; }
+      }
+    }
+
+    // Trash hands always fold
+    wFold += TRASH_WEIGHT_TOTAL;
+    const wTotal = wRaise + wMix + wCall + wFold;
+
+    // Facing raise stats
+    const facing = {};
+    if (pos !== "UTG") {
+      const openers = POSITIONS.filter(p => POSITIONS.indexOf(p) < POSITIONS.indexOf(pos));
+      for (const opener of openers) {
+        let fw3bet = 0, fwCall = 0, fwMixCall = 0, fwFold = 0;
+
+        for (const high of PAT_HIGH_CARDS) {
+          for (const ranks of PAT_RANK_COMBOS[high]) {
+            const cards = makeRepresentativePatHand(ranks);
+            const evData = calcHandEV(cards, pos);
+            const action = getFacingRaiseActions(pos, opener, evData);
+            if (action.action === "3-BET") fw3bet += PAT_WEIGHT;
+            else if (action.action === "CALL") fwCall += PAT_WEIGHT;
+            else if (action.action.includes("Call")) fwMixCall += PAT_WEIGHT;
+            else fwFold += PAT_WEIGHT;
+          }
+        }
+        for (const high of ALL_TRI_HIGH_CARDS) {
+          for (const ranks of ALL_TRI_COMBOS[high]) {
+            const cards = makeRepresentativeTriHand(ranks);
+            const evData = calcHandEV(cards, pos);
+            const action = getFacingRaiseActions(pos, opener, evData);
+            if (action.action === "3-BET") fw3bet += TRI_WEIGHT;
+            else if (action.action === "CALL") fwCall += TRI_WEIGHT;
+            else if (action.action.includes("Call")) fwMixCall += TRI_WEIGHT;
+            else fwFold += TRI_WEIGHT;
+          }
+        }
+        for (const high of ALL_TWO_HIGH_CARDS) {
+          for (const ranks of ALL_TWO_COMBOS[high]) {
+            const cards = makeRepresentativeTwoHand(ranks);
+            const evData = calcHandEV(cards, pos);
+            const action = getFacingRaiseActions(pos, opener, evData);
+            if (action.action === "3-BET") fw3bet += TWO_WEIGHT;
+            else if (action.action === "CALL") fwCall += TWO_WEIGHT;
+            else if (action.action.includes("Call")) fwMixCall += TWO_WEIGHT;
+            else fwFold += TWO_WEIGHT;
+          }
+        }
+        fwFold += TRASH_WEIGHT_TOTAL;
+        const fwTotal = fw3bet + fwCall + fwMixCall + fwFold;
+        facing[opener] = { threeBet: fw3bet, call: fwCall, mixCall: fwMixCall, fold: fwFold, total: fwTotal };
+      }
+    }
+
+    stats[pos] = {
+      rfi: { raise: wRaise, mix: wMix, call: wCall, fold: wFold, total: wTotal },
+      byType,
+      facing
+    };
+  }
+  return stats;
+}
+
+const RANGE_STATS = computeWeightedRangeStats();
+
+// ============================================================
+// CARD DISPLAY COMPONENT
+// ============================================================
+
+function Card({ rank, suit, small }) {
+  const size = small ? "28px" : "42px";
+  const fontSize = small ? "11px" : "15px";
+  return (
+    <div style={{
+      display: "inline-flex", alignItems: "center", justifyContent: "center",
+      width: size, height: small ? "38px" : "58px",
+      background: "#fff", border: "2px solid #d1d5db", borderRadius: "6px",
+      color: SUIT_COLORS[suit], fontWeight: 700, fontSize,
+      fontFamily: "monospace", margin: "2px", boxShadow: "0 1px 3px rgba(0,0,0,0.12)",
+      flexDirection: "column", lineHeight: 1.1
+    }}>
+      <span>{rank}</span>
+      <span style={{ fontSize: small ? "10px" : "14px" }}>{SUIT_SYMBOLS[suit]}</span>
+    </div>
+  );
+}
+
+function HandDisplay({ cards, small }) {
+  return (
+    <div style={{ display: "flex", gap: "2px", flexWrap: "wrap" }}>
+      {cards.map((c, i) => <Card key={i} rank={c.rank} suit={c.suit} small={small} />)}
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+
+function BadugiSolver() {
+  const [activeTab, setActiveTab] = useState("flow");
+  const [selectedPosition, setSelectedPosition] = useState("BTN");
+  const [selectedCategory, setSelectedCategory] = useState("tri");
+  const [facingRaise, setFacingRaise] = useState(false);
+  const [raiserPosition, setRaiserPosition] = useState("CO");
+  const [equityHand, setEquityHand] = useState(null);
+  const [actionHistory, setActionHistory] = useState([]);
+  const [flowCategory, setFlowCategory] = useState("tri");
+  const [statsView, setStatsView] = useState("rfi");
+  const [statsFacingOpener, setStatsFacingOpener] = useState("UTG");
+
+  const categoryData = useMemo(() => {
+    const pos = selectedPosition;
+    const hands = EXAMPLE_HANDS[selectedCategory];
+    return hands.map(h => {
+      const evData = calcHandEV(h.cards, pos);
+      const action = facingRaise
+        ? getFacingRaiseActions(pos, raiserPosition, evData)
+        : getPositionActions(pos, evData);
+      return { ...h, evData, action };
+    });
+  }, [selectedPosition, selectedCategory, facingRaise, raiserPosition]);
+
+  const penaltyData = useMemo(() => {
+    return PENALTY_EXAMPLES.map(ex => ({
+      ...ex,
+      evA: calcHandEV(ex.handA.cards, selectedPosition),
+      evB: calcHandEV(ex.handB.cards, selectedPosition)
+    }));
+  }, [selectedPosition]);
+
+  const equityResult = useMemo(() => {
+    if (!equityHand) return null;
+    const heroCards = equityHand.cards;
+    const range = [
+      ...EXAMPLE_HANDS.pat,
+      ...EXAMPLE_HANDS.tri,
+      ...EXAMPLE_HANDS.two
+    ];
+    return calcEquityVsRange(heroCards, range);
+  }, [equityHand]);
+
+  const tabStyle = (tab) => ({
+    padding: "10px 20px", cursor: "pointer", fontWeight: 600,
+    fontSize: "14px", border: "none", borderRadius: "8px 8px 0 0",
+    background: activeTab === tab ? "#1e293b" : "#e2e8f0",
+    color: activeTab === tab ? "#fff" : "#475569",
+    transition: "all 0.2s"
+  });
+
+  const posBtn = (pos) => ({
+    padding: "8px 16px", cursor: "pointer", fontWeight: 700,
+    fontSize: "13px", border: "2px solid",
+    borderColor: selectedPosition === pos ? POSITION_COLORS[pos] : "#cbd5e1",
+    borderRadius: "8px",
+    background: selectedPosition === pos ? POSITION_COLORS[pos] : "#f8fafc",
+    color: selectedPosition === pos ? "#fff" : "#334155",
+    transition: "all 0.15s"
+  });
+
+  const catBtn = (cat, label) => ({
+    padding: "8px 18px", cursor: "pointer", fontWeight: 600,
+    fontSize: "13px", border: "2px solid",
+    borderColor: selectedCategory === cat ? "#6366f1" : "#cbd5e1",
+    borderRadius: "8px",
+    background: selectedCategory === cat ? "#6366f1" : "#f8fafc",
+    color: selectedCategory === cat ? "#fff" : "#334155",
+    transition: "all 0.15s"
+  });
+
+  return (
+    <div style={{
+      maxWidth: "960px", margin: "0 auto", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      background: "#f8fafc", minHeight: "100vh", padding: "20px"
+    }}>
+      {/* Header */}
+      <div style={{
+        background: "linear-gradient(135deg, #1e293b 0%, #334155 100%)",
+        borderRadius: "16px", padding: "24px 28px", marginBottom: "20px",
+        color: "#fff"
+      }}>
+        <h1 style={{ margin: 0, fontSize: "26px", fontWeight: 800, letterSpacing: "-0.5px", textAlign: "center" }}>
+          Badugi Solver
+        </h1>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
+        <button style={tabStyle("flow")} onClick={() => setActiveTab("flow")}>Action Flow</button>
+        <button style={tabStyle("stats")} onClick={() => setActiveTab("stats")}>Range Stats</button>
+        <button style={tabStyle("categories")} onClick={() => setActiveTab("categories")}>Hand Categories</button>
+      </div>
+
+      <div style={{
+        background: "#fff", borderRadius: "0 12px 12px 12px", padding: "20px",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.08)", minHeight: "400px"
+      }}>
+
+        {/* ==================== CATEGORIES TAB ==================== */}
+        {activeTab === "categories" && (
+          <div>
+            {/* Category buttons */}
+            <div style={{ display: "flex", gap: "8px", marginBottom: "10px", flexWrap: "wrap" }}>
+              <button style={catBtn("pat")} onClick={() => setSelectedCategory("pat")}>Pat Hands (Draw 0)</button>
+              <button style={catBtn("tri")} onClick={() => setSelectedCategory("tri")}>Tri-Cards (Draw 1)</button>
+              <button style={catBtn("two")} onClick={() => setSelectedCategory("two")}>Two-Cards (Draw 2)</button>
+            </div>
+            <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "14px", lineHeight: 1.4, padding: "0 2px" }}>
+              {selectedCategory === "tri" && `A hand is only a tri-card if you keep all 3 and draw 1. J-high is the weakest tri — Q/K-high tris break to draw 2 and appear in Two-Cards. Table shows the worst ${facingRaise ? "defending" : "profitable open"} per highest card.`}
+              {selectedCategory === "two" && "Includes pure two-card hands and structurally-tri hands where the optimal play is to break and draw 2 from a stronger base."}
+              {selectedCategory === "pat" && `Made badugis — stand pat (draw 0). Most open from all positions, but the worst pats (K-high with high lower cards) fold from early position — no blockers, no snow defense. ${facingRaise ? "When facing a raise, only hands that defend (3-bet or call) appear." : ""}`}
+            </div>
+
+            {/* Facing raise toggle — UTG can't face a raise (first to act) */}
+            {selectedPosition === "UTG" ? (
+              <div style={{
+                display: "flex", alignItems: "center", gap: "12px",
+                marginBottom: "16px", padding: "10px 14px",
+                background: "#f1f5f9", borderRadius: "8px"
+              }}>
+                <div style={{
+                  padding: "6px 14px", borderRadius: "6px", border: "none",
+                  fontWeight: 600, fontSize: "13px",
+                  background: "#cbd5e1", color: "#94a3b8"
+                }}>
+                  Facing Raise: N/A
+                </div>
+                <span style={{ fontSize: "12px", color: "#64748b" }}>
+                  UTG is first to act — can only open or fold
+                </span>
+              </div>
+            ) : (
+              <div style={{
+                display: "flex", alignItems: "center", gap: "12px",
+                marginBottom: "16px", padding: "10px 14px",
+                background: facingRaise ? "#fef3c7" : "#f1f5f9", borderRadius: "8px"
+              }}>
+                <button
+                  onClick={() => setFacingRaise(!facingRaise)}
+                  style={{
+                    padding: "6px 14px", borderRadius: "6px", border: "none", cursor: "pointer",
+                    fontWeight: 600, fontSize: "13px",
+                    background: facingRaise ? "#f59e0b" : "#94a3b8",
+                    color: "#fff"
+                  }}
+                >
+                  {facingRaise ? "Facing Raise: ON" : "Facing Raise: OFF"}
+                </button>
+                {facingRaise && (
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <span style={{ fontSize: "12px", color: "#92400e", fontWeight: 600 }}>Raiser:</span>
+                    {POSITIONS.filter(p => {
+                      // Only show positions that act BEFORE the selected position
+                      const myIdx = POSITIONS.indexOf(selectedPosition);
+                      const theirIdx = POSITIONS.indexOf(p);
+                      return theirIdx < myIdx;
+                    }).map(pos => (
+                      <button
+                        key={pos}
+                        onClick={() => setRaiserPosition(pos)}
+                        style={{
+                          padding: "4px 10px", borderRadius: "4px", border: "1px solid",
+                          borderColor: raiserPosition === pos ? POSITION_COLORS[pos] : "#d1d5db",
+                          background: raiserPosition === pos ? POSITION_COLORS[pos] : "#fff",
+                          color: raiserPosition === pos ? "#fff" : "#475569",
+                          fontWeight: 600, fontSize: "11px", cursor: "pointer"
+                        }}
+                      >
+                        {pos}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* PAT HAND TABLE — when pat is selected */}
+            {selectedCategory === "pat" && (() => {
+              const raiserIdx = POSITIONS.indexOf(raiserPosition);
+              const displayPositions = facingRaise
+                ? POSITIONS.filter((_, i) => i > raiserIdx)  // only positions AFTER the raiser defend
+                : POSITIONS;
+              const tableData = {};
+              for (const pos of displayPositions) {
+                tableData[pos] = {};
+                for (const high of PAT_HIGH_CARDS) {
+                  tableData[pos][high] = facingRaise
+                    ? findWorstDefendPat(PAT_RANK_COMBOS[high], pos, raiserPosition)
+                    : findWorstProfitablePatOpen(PAT_RANK_COMBOS[high], pos);
+                }
+              }
+              const comboCountRow = PAT_HIGH_CARDS.map(h => PAT_RANK_COMBOS[h].length);
+
+              return (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{
+                    width: "100%", borderCollapse: "collapse", fontSize: "12px",
+                    border: "1px solid #e2e8f0", borderRadius: "8px"
+                  }}>
+                    <thead>
+                      <tr style={{ background: "#14532d" }}>
+                        <th style={{
+                          padding: "10px 8px", color: "#94a3b8", fontSize: "10px",
+                          fontWeight: 700, textAlign: "left", borderRight: "1px solid #166534",
+                          minWidth: "54px"
+                        }}>
+                          Position
+                        </th>
+                        {PAT_HIGH_CARDS.map((high, i) => (
+                          <th key={high} style={{
+                            padding: "10px 4px", color: "#fff", textAlign: "center",
+                            borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #166534" : "none",
+                            minWidth: "72px"
+                          }}>
+                            <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
+                            <div style={{ fontSize: "9px", color: "#86efac", fontWeight: 500 }}>
+                              ({comboCountRow[i]})
+                            </div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayPositions.map((pos, posIdx) => (
+                        <tr key={pos} style={{
+                          background: pos === selectedPosition ? "#ecfdf5" : posIdx % 2 === 0 ? "#fafafa" : "#fff"
+                        }}>
+                          <td style={{
+                            padding: "10px 8px", fontWeight: 700, fontSize: "12px",
+                            color: POSITION_COLORS[pos],
+                            borderRight: "1px solid #e2e8f0",
+                            borderBottom: "1px solid #e2e8f0",
+                            background: pos === selectedPosition ? "#dcfce7" : "inherit"
+                          }}>
+                            {pos}{facingRaise ? ` vs ${raiserPosition}` : ""}
+                          </td>
+                          {PAT_HIGH_CARDS.map((high, i) => {
+                            const entry = tableData[pos][high];
+                            return (
+                              <td key={high} style={{
+                                padding: "6px 4px", textAlign: "center",
+                                borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none",
+                                borderBottom: "1px solid #e2e8f0",
+                                background: entry ? "inherit" : "#f9fafb"
+                              }}>
+                                {entry ? (
+                                  <div>
+                                    <div style={{
+                                      fontWeight: 700, fontSize: "10px", color: "#1e293b",
+                                      marginBottom: "1px"
+                                    }}>
+                                      {entry.label}
+                                    </div>
+                                    <div style={{
+                                      fontSize: "12px", fontWeight: 800,
+                                      color: entry.bb > 0.10 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626"
+                                    }}>
+                                      {formatBB(entry.bb)} BB
+                                    </div>
+                                    <div style={{
+                                      fontSize: "9px", fontWeight: 600, marginTop: "1px",
+                                      padding: "1px 3px", borderRadius: "3px", display: "inline-block",
+                                      background: "#dcfce7", color: "#166534"
+                                    }}>
+                                      {entry.action}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div style={{ color: "#cbd5e1", fontSize: "10px", fontStyle: "italic" }}>
+                                    — fold all —
+                                  </div>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <div style={{
+                    marginTop: "12px", padding: "10px 14px", background: "#f0fdf4",
+                    borderRadius: "8px", border: "1px solid #bbf7d0",
+                    fontSize: "11px", color: "#166534", lineHeight: 1.5
+                  }}>
+                    <strong>Not all pat hands are automatic opens.</strong> The worst pats (K-high with all high lower cards)
+                    fold from early position — they have zero blocker value, lose to every other badugi at showdown,
+                    and are completely vulnerable to snowing. Low-card pats (A-2-3-7r) block opponents from making
+                    strong hands AND give you snow defense information.
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* TRI-CARD TABLE — when tri is selected, show the highest-card table */}
+            {selectedCategory === "tri" && (() => {
+              // Build table data: for each position, find worst profitable open per highest card
+              const raiserIdx = POSITIONS.indexOf(raiserPosition);
+              const displayPositions = facingRaise
+                ? POSITIONS.filter((_, i) => i > raiserIdx)
+                : POSITIONS;
+              const tableData = {};
+              for (const pos of displayPositions) {
+                tableData[pos] = {};
+                for (const high of TRI_HIGH_CARDS) {
+                  tableData[pos][high] = facingRaise
+                    ? findWorstDefendTri(TRI_RANK_COMBOS[high], pos, raiserPosition)
+                    : findWorstProfitableOpen(TRI_RANK_COMBOS[high], pos);
+                }
+              }
+              const comboCountRow = TRI_HIGH_CARDS.map(h => TRI_RANK_COMBOS[h].length);
+
+              return (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{
+                    width: "100%", borderCollapse: "collapse", fontSize: "12px",
+                    border: "1px solid #e2e8f0", borderRadius: "8px"
+                  }}>
+                    <thead>
+                      {/* Header row: highest card + combo count */}
+                      <tr style={{ background: "#1e293b" }}>
+                        <th style={{
+                          padding: "10px 8px", color: "#94a3b8", fontSize: "10px",
+                          fontWeight: 700, textAlign: "left", borderRight: "1px solid #334155",
+                          minWidth: "54px"
+                        }}>
+                          Position
+                        </th>
+                        {TRI_HIGH_CARDS.map((high, i) => (
+                          <th key={high} style={{
+                            padding: "10px 6px", color: "#fff", textAlign: "center",
+                            borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #334155" : "none",
+                            minWidth: "80px"
+                          }}>
+                            <div style={{ fontSize: "16px", fontWeight: 800 }}>{high}</div>
+                            <div style={{ fontSize: "10px", color: "#94a3b8", fontWeight: 500 }}>
+                              ({comboCountRow[i]} combos)
+                            </div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayPositions.map((pos, posIdx) => (
+                        <tr key={pos} style={{
+                          background: pos === selectedPosition ? "#eef2ff" : posIdx % 2 === 0 ? "#fafafa" : "#fff"
+                        }}>
+                          <td style={{
+                            padding: "10px 8px", fontWeight: 700, fontSize: "12px",
+                            color: POSITION_COLORS[pos],
+                            borderRight: "1px solid #e2e8f0",
+                            borderBottom: "1px solid #e2e8f0",
+                            background: pos === selectedPosition ? "#e0e7ff" : "inherit"
+                          }}>
+                            {pos}{facingRaise ? ` vs ${raiserPosition}` : ""}
+                          </td>
+                          {TRI_HIGH_CARDS.map((high, i) => {
+                            const entry = tableData[pos][high];
+                            return (
+                              <td key={high} style={{
+                                padding: "8px 6px", textAlign: "center",
+                                borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none",
+                                borderBottom: "1px solid #e2e8f0",
+                                background: entry
+                                  ? (entry.action === "FOLD" ? "#fef2f2"
+                                    : entry.action.includes("MIX") ? "#fffbeb" : "inherit")
+                                  : "#f9fafb"
+                              }}>
+                                {entry ? (
+                                  <div>
+                                    <div style={{
+                                      fontWeight: 700, fontSize: "11px", color: "#1e293b",
+                                      marginBottom: "2px"
+                                    }}>
+                                      {entry.label}
+                                    </div>
+                                    <div style={{
+                                      fontSize: "13px", fontWeight: 800,
+                                      color: entry.bb > 0.05 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626"
+                                    }}>
+                                      {formatBB(entry.bb)} BB
+                                    </div>
+                                    <div style={{
+                                      fontSize: "9px", fontWeight: 600, marginTop: "2px",
+                                      padding: "1px 4px", borderRadius: "3px", display: "inline-block",
+                                      background: entry.action.includes("MIX") ? "#fef3c7"
+                                        : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
+                                      color: entry.action.includes("MIX") ? "#92400e"
+                                        : entry.action === "RAISE" ? "#166534" : "#1e40af"
+                                    }}>
+                                      {entry.action}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div style={{ color: "#cbd5e1", fontSize: "11px", fontStyle: "italic" }}>
+                                    — fold all —
+                                  </div>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {/* Legend */}
+                  <div style={{
+                    marginTop: "12px", padding: "10px 14px", background: "#f8fafc",
+                    borderRadius: "8px", border: "1px solid #e2e8f0",
+                    display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "center",
+                    fontSize: "11px", color: "#64748b"
+                  }}>
+                    <span style={{ fontWeight: 700, color: "#475569" }}>Reading the table:</span>
+                    <span>Each cell shows the <strong>worst</strong> rank combo that's still a profitable open from that position.</span>
+                    <span>If a cell shows A-2-7r from UTG under the "7" column, that means A-2-7r is the weakest 7-high tri that UTG opens.</span>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* TWO-CARD TABLE — when two is selected */}
+            {selectedCategory === "two" && (() => {
+              const raiserIdx = POSITIONS.indexOf(raiserPosition);
+              const displayPositions = facingRaise
+                ? POSITIONS.filter((_, i) => i > raiserIdx)
+                : POSITIONS;
+              const tableData = {};
+              for (const pos of displayPositions) {
+                tableData[pos] = {};
+                for (const high of TWO_HIGH_CARDS) {
+                  tableData[pos][high] = facingRaise
+                    ? findWorstDefendTwo(TWO_RANK_COMBOS[high], pos, raiserPosition)
+                    : findWorstProfitableTwoOpen(TWO_RANK_COMBOS[high], pos);
+                }
+              }
+              const comboCountRow = TWO_HIGH_CARDS.map(h => TWO_RANK_COMBOS[h].length);
+
+              return (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{
+                    width: "100%", borderCollapse: "collapse", fontSize: "12px",
+                    border: "1px solid #e2e8f0", borderRadius: "8px"
+                  }}>
+                    <thead>
+                      <tr style={{ background: "#3b0764" }}>
+                        <th style={{
+                          padding: "10px 8px", color: "#94a3b8", fontSize: "10px",
+                          fontWeight: 700, textAlign: "left", borderRight: "1px solid #581c87",
+                          minWidth: "54px"
+                        }}>
+                          Position
+                        </th>
+                        {TWO_HIGH_CARDS.map((high, i) => (
+                          <th key={high} style={{
+                            padding: "10px 6px", color: "#fff", textAlign: "center",
+                            borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #581c87" : "none",
+                            minWidth: "80px"
+                          }}>
+                            <div style={{ fontSize: "16px", fontWeight: 800 }}>{high}</div>
+                            <div style={{ fontSize: "10px", color: "#c4b5fd", fontWeight: 500 }}>
+                              ({comboCountRow[i]} {comboCountRow[i] === 1 ? "base" : "bases"})
+                            </div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayPositions.map((pos, posIdx) => (
+                        <tr key={pos} style={{
+                          background: pos === selectedPosition ? "#f5f3ff" : posIdx % 2 === 0 ? "#fafafa" : "#fff"
+                        }}>
+                          <td style={{
+                            padding: "10px 8px", fontWeight: 700, fontSize: "12px",
+                            color: POSITION_COLORS[pos],
+                            borderRight: "1px solid #e2e8f0",
+                            borderBottom: "1px solid #e2e8f0",
+                            background: pos === selectedPosition ? "#ede9fe" : "inherit"
+                          }}>
+                            {pos}{facingRaise ? ` vs ${raiserPosition}` : ""}
+                          </td>
+                          {TWO_HIGH_CARDS.map((high, i) => {
+                            const entry = tableData[pos][high];
+                            return (
+                              <td key={high} style={{
+                                padding: "8px 6px", textAlign: "center",
+                                borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none",
+                                borderBottom: "1px solid #e2e8f0",
+                                background: entry
+                                  ? (entry.action.includes("MIX") ? "#fffbeb" : "inherit")
+                                  : "#f9fafb"
+                              }}>
+                                {entry ? (
+                                  <div>
+                                    <div style={{
+                                      fontWeight: 700, fontSize: "11px", color: "#1e293b",
+                                      marginBottom: "2px"
+                                    }}>
+                                      {entry.label}
+                                    </div>
+                                    <div style={{
+                                      fontSize: "13px", fontWeight: 800,
+                                      color: entry.bb > 0.05 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626"
+                                    }}>
+                                      {formatBB(entry.bb)} BB
+                                    </div>
+                                    <div style={{
+                                      fontSize: "9px", fontWeight: 600, marginTop: "2px",
+                                      padding: "1px 4px", borderRadius: "3px", display: "inline-block",
+                                      background: entry.action.includes("MIX") ? "#fef3c7"
+                                        : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
+                                      color: entry.action.includes("MIX") ? "#92400e"
+                                        : entry.action === "RAISE" ? "#166534" : "#1e40af"
+                                    }}>
+                                      {entry.action}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div style={{ color: "#cbd5e1", fontSize: "11px", fontStyle: "italic" }}>
+                                    — fold all —
+                                  </div>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <div style={{
+                    marginTop: "12px", padding: "10px 14px", background: "#f5f3ff",
+                    borderRadius: "8px", border: "1px solid #ddd6fe",
+                    fontSize: "11px", color: "#5b21b6", lineHeight: 1.5
+                  }}>
+                    <strong>Two-card bases draw 2.</strong> Columns show the highest card of the base you keep.
+                    "2" column = A-2 base (the best). The table uses typical high-card deadwood — hands with
+                    low-card deadwood (better blockers) will perform slightly better. Includes broken tris
+                    that reduce to these bases. Bases above 9 almost always fold.
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ==================== ACTION FLOW TAB ==================== */}
+        {activeTab === "flow" && (() => {
+          // Derive game state from action history
+          // Track bet level: 1=open/raise, 2=3-bet, 3=4-bet, 4=5-bet (cap)
+          const aggressiveActions = actionHistory.filter(h =>
+            ["RAISE", "3-BET", "4-BET", "5-BET"].includes(h.action)
+          );
+          const betLevel = aggressiveActions.length; // 0=no action, 1=open, 2=3bet, 3=4bet, 4=5bet(cap)
+          const lastAggressor = aggressiveActions.length > 0 ? aggressiveActions[aggressiveActions.length - 1] : null;
+          const opener = actionHistory.find(h => h.action === "RAISE");
+          const callerCount = actionHistory.filter(h => h.action === "CALL").length;
+          const actedSet = new Set(actionHistory.map(h => h.pos));
+
+          // Determine next position to act
+          let nextPos = null;
+          let needsReaction = false;
+
+          // After a re-raise (3-bet, 4-bet, etc.), the previous aggressor needs to respond
+          if (actionHistory.length > 0 && betLevel >= 2) {
+            const prevAggressor = aggressiveActions[aggressiveActions.length - 2];
+            if (prevAggressor && !actionHistory.find(h => h.pos === prevAggressor.pos && h.reAction)) {
+              const allInitial = POSITIONS.every(p => actedSet.has(p));
+              if (allInitial) {
+                nextPos = prevAggressor.pos;
+                needsReaction = true;
+              }
+            }
+          }
+
+          if (!nextPos && !needsReaction) {
+            nextPos = POSITIONS.find(p => !actedSet.has(p));
+          }
+
+          const isComplete = !nextPos;
+          const isRFI = betLevel === 0; // No one has raised yet
+
+          // Determine available actions based on current bet level
+          // Limit Badugi: 5-bet cap (open, 3-bet, 4-bet, 5-bet, then capped)
+          const getAvailableActions = () => {
+            if (!nextPos) return [];
+            if (needsReaction) {
+              // Previous aggressor faces a re-raise
+              if (betLevel >= 4) return ["CALL", "FOLD"]; // 5-bet cap reached
+              return ["CALL", `${betLevel + 2}-BET`, "FOLD"];
+            }
+            if (isRFI) {
+              if (nextPos === "SB") return ["RAISE", "CALL", "FOLD"];
+              if (nextPos === "BB") return ["RAISE", "CALL", "FOLD"];
+              return ["RAISE", "FOLD"];
+            }
+            // Facing aggression — next raise level depends on current bet level
+            if (betLevel >= 4) return ["CALL", "FOLD"]; // 5-bet cap
+            const nextRaiseLabel = `${betLevel + 2}-BET`; // facing open(1)→"3-BET", facing 3bet(2)→"4-BET", facing 4bet(3)→"5-BET"
+            return [nextRaiseLabel, "CALL", "FOLD"];
+          };
+
+          const availableActions = getAvailableActions();
+
+          // Build the table for current position
+          const getFlowTableData = (category, highCards, combos, makeHand, findFunc) => {
+            if (!nextPos) return null;
+            const tableData = {};
+            for (const high of highCards) {
+              let hands = [];
+              for (const ranks of combos[high]) {
+                const cards = makeHand(ranks);
+                const evData = calcHandEV(cards, nextPos);
+                const action = isRFI
+                  ? getPositionActions(nextPos, evData)
+                  : getFacingRaiseActions(nextPos, lastAggressor?.pos || "UTG", evData, betLevel, callerCount);
+                hands.push({
+                  combo: ranks, ev: evData.ev,
+                  bb: toDisplayBB(evData.ev, nextPos),
+                  action: action.action,
+                  label: ranks.join("-") + (ranks.length >= 3 ? "r" : "")
+                });
+              }
+              // Find worst non-fold
+              const nonFolds = hands.filter(h => h.action !== "FOLD");
+              nonFolds.sort((a, b) => a.ev - b.ev);
+              tableData[high] = nonFolds[0] || null;
+            }
+            return tableData;
+          };
+
+          const actionBtnStyle = (act) => {
+            // Color any X-BET action as a raise color, escalating intensity
+            let c;
+            if (act === "RAISE") c = { bg: "#22c55e", border: "#16a34a" };
+            else if (act === "3-BET") c = { bg: "#22c55e", border: "#16a34a" };
+            else if (act === "4-BET") c = { bg: "#a855f7", border: "#7c3aed" };
+            else if (act === "5-BET") c = { bg: "#dc2626", border: "#b91c1c" };
+            else if (act === "CALL") c = { bg: "#3b82f6", border: "#2563eb" };
+            else if (act === "FOLD") c = { bg: "#ef4444", border: "#dc2626" };
+            else c = { bg: "#94a3b8", border: "#64748b" };
+            return {
+              padding: "10px 24px", borderRadius: "8px", border: `2px solid ${c.border}`,
+              background: c.bg, color: "#fff", fontWeight: 700, fontSize: "14px",
+              cursor: "pointer", transition: "all 0.15s"
+            };
+          };
+
+          const handleAction = (action) => {
+            if (needsReaction) {
+              setActionHistory(prev => [...prev, { pos: nextPos, action, reAction: true }]);
+            } else {
+              setActionHistory(prev => [...prev, { pos: nextPos, action }]);
+            }
+          };
+
+          return (
+            <div>
+              {/* Flow diagram — show action history */}
+              <div style={{
+                padding: "14px 16px", background: "#f8fafc", borderRadius: "10px",
+                marginBottom: "16px", border: "1px solid #e2e8f0"
+              }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+                  <span style={{ fontSize: "12px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "1px" }}>
+                    Action Sequence
+                  </span>
+                  <button onClick={() => setActionHistory([])} style={{
+                    padding: "4px 12px", borderRadius: "4px", border: "1px solid #cbd5e1",
+                    background: "#fff", color: "#64748b", fontSize: "11px", fontWeight: 600, cursor: "pointer"
+                  }}>
+                    Reset
+                  </button>
+                </div>
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                  {POSITIONS.map((pos, idx) => {
+                    const entry = actionHistory.find(h => h.pos === pos && !h.reAction);
+                    const reEntry = actionHistory.find(h => h.pos === pos && h.reAction);
+                    const isCurrent = pos === nextPos && !needsReaction;
+                    const isReacting = pos === nextPos && needsReaction;
+                    return (
+                      <div key={pos} style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                        {idx > 0 && <span style={{ color: "#cbd5e1", fontWeight: 700 }}>→</span>}
+                        <div style={{
+                          padding: "6px 12px", borderRadius: "6px",
+                          border: `2px solid ${isCurrent || isReacting ? POSITION_COLORS[pos] : entry ? "#e2e8f0" : "#f1f5f9"}`,
+                          background: isCurrent || isReacting ? POSITION_COLORS[pos] + "15"
+                            : entry ? (entry.action === "FOLD" ? "#fef2f2" : ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#f0fdf4" : "#eff6ff")
+                            : "#f9fafb",
+                          minWidth: "60px", textAlign: "center"
+                        }}>
+                          <div style={{ fontSize: "11px", fontWeight: 700, color: POSITION_COLORS[pos] }}>{pos}</div>
+                          {entry && (
+                            <div style={{
+                              fontSize: "10px", fontWeight: 600, marginTop: "2px",
+                              color: entry.action === "FOLD" ? "#dc2626" : ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#16a34a" : "#2563eb"
+                            }}>
+                              {entry.action}
+                            </div>
+                          )}
+                          {reEntry && (
+                            <div style={{ fontSize: "9px", fontWeight: 600, marginTop: "1px", color: "#7c3aed" }}>
+                              → {reEntry.action}
+                            </div>
+                          )}
+                          {(isCurrent || isReacting) && !entry && (
+                            <div style={{ fontSize: "9px", color: "#94a3b8", marginTop: "2px" }}>deciding...</div>
+                          )}
+                          {isReacting && entry && (
+                            <div style={{ fontSize: "9px", color: "#7c3aed", marginTop: "2px" }}>re-acting...</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Current decision */}
+              {nextPos && (
+                <div>
+                  {/* Scenario description */}
+                  <div style={{
+                    padding: "12px 16px", borderRadius: "8px", marginBottom: "14px",
+                    background: POSITION_COLORS[nextPos] + "12",
+                    border: `1px solid ${POSITION_COLORS[nextPos]}30`
+                  }}>
+                    <span style={{ fontWeight: 800, color: POSITION_COLORS[nextPos], fontSize: "15px" }}>{nextPos}</span>
+                    <span style={{ color: "#475569", fontWeight: 600, fontSize: "14px" }}>
+                      {needsReaction
+                        ? ` faces ${actionHistory.find(h => h.action === "3-BET")?.pos}'s 3-bet`
+                        : isRFI
+                          ? actionHistory.length === 0
+                            ? " is first to act (UTG)"
+                            : ` is next — everyone before folded (RFI)`
+                          : ` faces ${lastAggressor?.pos}'s ${lastAggressor?.action?.toLowerCase()}`
+                      }
+                    </span>
+                  </div>
+
+                  {/* Opening range composition breakdown */}
+                  {(() => {
+                    // Compute % breakdown of opening range by hand type
+                    let patOpen = 0, triOpen = 0, twoOpen = 0;
+                    // Pat hands
+                    for (const high of PAT_HIGH_CARDS) {
+                      for (const ranks of PAT_RANK_COMBOS[high]) {
+                        const cards = makeRepresentativePatHand(ranks);
+                        const evData = calcHandEV(cards, nextPos);
+                        const action = isRFI
+                          ? getPositionActions(nextPos, evData)
+                          : getFacingRaiseActions(nextPos, lastAggressor?.pos || "UTG", evData, betLevel, callerCount);
+                        if (action.action !== "FOLD") {
+                          patOpen += action.action.includes("MIX") || action.action.includes("Call") ? PAT_WEIGHT * 0.5 : PAT_WEIGHT;
+                        }
+                      }
+                    }
+                    // Tri hands
+                    for (const high of ALL_TRI_HIGH_CARDS) {
+                      for (const ranks of ALL_TRI_COMBOS[high]) {
+                        const cards = makeRepresentativeTriHand(ranks);
+                        const evData = calcHandEV(cards, nextPos);
+                        const action = isRFI
+                          ? getPositionActions(nextPos, evData)
+                          : getFacingRaiseActions(nextPos, lastAggressor?.pos || "UTG", evData, betLevel, callerCount);
+                        if (action.action !== "FOLD") {
+                          triOpen += action.action.includes("MIX") || action.action.includes("Call") ? TRI_WEIGHT * 0.5 : TRI_WEIGHT;
+                        }
+                      }
+                    }
+                    // Two-card hands
+                    for (const high of ALL_TWO_HIGH_CARDS) {
+                      for (const ranks of ALL_TWO_COMBOS[high]) {
+                        const cards = makeRepresentativeTwoHand(ranks);
+                        const evData = calcHandEV(cards, nextPos);
+                        const action = isRFI
+                          ? getPositionActions(nextPos, evData)
+                          : getFacingRaiseActions(nextPos, lastAggressor?.pos || "UTG", evData, betLevel, callerCount);
+                        if (action.action !== "FOLD") {
+                          twoOpen += action.action.includes("MIX") || action.action.includes("Call") ? TWO_WEIGHT * 0.5 : TWO_WEIGHT;
+                        }
+                      }
+                    }
+                    const totalOpen = patOpen + triOpen + twoOpen;
+                    if (totalOpen === 0) return null;
+                    const pPat = (patOpen / totalOpen * 100).toFixed(1);
+                    const pTri = (triOpen / totalOpen * 100).toFixed(1);
+                    const pTwo = (twoOpen / totalOpen * 100).toFixed(1);
+                    return (
+                      <div style={{
+                        display: "flex", gap: "12px", marginBottom: "12px", padding: "10px 14px",
+                        background: "#f8fafc", borderRadius: "8px", border: "1px solid #e2e8f0",
+                        alignItems: "center", flexWrap: "wrap"
+                      }}>
+                        <span style={{ fontSize: "11px", fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+                          {isRFI ? "Opening" : "Defending"} Range Makeup:
+                        </span>
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                          <span style={{ padding: "3px 10px", borderRadius: "4px", background: "#dcfce7", color: "#166534", fontSize: "12px", fontWeight: 700 }}>
+                            {pPat}% Pat
+                          </span>
+                          <span style={{ padding: "3px 10px", borderRadius: "4px", background: "#dbeafe", color: "#1e40af", fontSize: "12px", fontWeight: 700 }}>
+                            {pTri}% Tri
+                          </span>
+                          <span style={{ padding: "3px 10px", borderRadius: "4px", background: "#f3e8ff", color: "#6b21a8", fontSize: "12px", fontWeight: 700 }}>
+                            {pTwo}% Two-Card
+                          </span>
+                        </div>
+                        {/* Visual bar */}
+                        <div style={{ flex: 1, minWidth: "120px", height: "12px", borderRadius: "6px", overflow: "hidden", display: "flex", background: "#e2e8f0" }}>
+                          <div style={{ width: `${pPat}%`, background: "#22c55e", height: "100%" }} title={`Pat: ${pPat}%`} />
+                          <div style={{ width: `${pTri}%`, background: "#3b82f6", height: "100%" }} title={`Tri: ${pTri}%`} />
+                          <div style={{ width: `${pTwo}%`, background: "#a855f7", height: "100%" }} title={`Two: ${pTwo}%`} />
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Category selector */}
+                  <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
+                    {[["pat", "Pat Hands"], ["tri", "Tri-Cards"], ["two", "Two-Cards"]].map(([cat, label]) => (
+                      <button key={cat} onClick={() => setFlowCategory(cat)} style={{
+                        padding: "6px 16px", cursor: "pointer", fontWeight: 600, fontSize: "12px",
+                        border: "2px solid", borderRadius: "6px",
+                        borderColor: flowCategory === cat ? "#6366f1" : "#cbd5e1",
+                        background: flowCategory === cat ? "#6366f1" : "#f8fafc",
+                        color: flowCategory === cat ? "#fff" : "#334155"
+                      }}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Table for current position */}
+                  {flowCategory === "tri" && (() => {
+                    const tableData = getFlowTableData("tri", TRI_HIGH_CARDS, TRI_RANK_COMBOS, makeRepresentativeTriHand);
+                    if (!tableData) return null;
+                    const comboCountRow = TRI_HIGH_CARDS.map(h => TRI_RANK_COMBOS[h].length);
+                    return (
+                      <div style={{ overflowX: "auto", marginBottom: "16px" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
+                          <thead>
+                            <tr style={{ background: "#1e293b" }}>
+                              <th style={{ padding: "8px", color: "#94a3b8", fontSize: "10px", fontWeight: 700, textAlign: "left", borderRight: "1px solid #334155", minWidth: "70px" }}>
+                                {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
+                              </th>
+                              {TRI_HIGH_CARDS.map((high, i) => (
+                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #334155" : "none", minWidth: "72px" }}>
+                                  <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
+                                  <div style={{ fontSize: "9px", color: "#94a3b8" }}>({comboCountRow[i]})</div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr style={{ background: "#fff" }}>
+                              <td style={{ padding: "10px 8px", fontWeight: 700, fontSize: "12px", color: POSITION_COLORS[nextPos], borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0" }}>
+                                {nextPos}
+                              </td>
+                              {TRI_HIGH_CARDS.map((high, i) => {
+                                const entry = tableData[high];
+                                const actionBg = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#dcfce7"
+                                    : entry.action === "CALL" ? "#dbeafe"
+                                      : entry.action.includes("MIX") || entry.action.includes("Call") ? "#fef3c7" : "#f1f5f9"
+                                  : "#f9fafb";
+                                const actionColor = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#166534"
+                                    : entry.action === "CALL" ? "#1e40af"
+                                      : entry.action.includes("MIX") || entry.action.includes("Call") ? "#92400e" : "#64748b"
+                                  : "#cbd5e1";
+                                return (
+                                  <td key={high} style={{ padding: "8px 4px", textAlign: "center", borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none", borderBottom: "1px solid #e2e8f0" }}>
+                                    {entry ? (
+                                      <div>
+                                        <div style={{ fontWeight: 700, fontSize: "10px", color: "#1e293b", marginBottom: "2px" }}>{entry.label}</div>
+                                        <div style={{ fontSize: "12px", fontWeight: 800, color: entry.bb > 0.05 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626" }}>
+                                          {formatBB(entry.bb)} BB
+                                        </div>
+                                        <div style={{ fontSize: "9px", fontWeight: 600, marginTop: "2px", padding: "1px 4px", borderRadius: "3px", display: "inline-block", background: actionBg, color: actionColor }}>
+                                          {entry.action}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div style={{ color: "#cbd5e1", fontSize: "10px", fontStyle: "italic" }}>— fold all —</div>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
+
+                  {flowCategory === "pat" && (() => {
+                    const tableData = getFlowTableData("pat", PAT_HIGH_CARDS, PAT_RANK_COMBOS, makeRepresentativePatHand);
+                    if (!tableData) return null;
+                    const comboCountRow = PAT_HIGH_CARDS.map(h => PAT_RANK_COMBOS[h].length);
+                    return (
+                      <div style={{ overflowX: "auto", marginBottom: "16px" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
+                          <thead>
+                            <tr style={{ background: "#14532d" }}>
+                              <th style={{ padding: "8px", color: "#94a3b8", fontSize: "10px", fontWeight: 700, textAlign: "left", borderRight: "1px solid #166534", minWidth: "70px" }}>
+                                {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
+                              </th>
+                              {PAT_HIGH_CARDS.map((high, i) => (
+                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #166534" : "none", minWidth: "66px" }}>
+                                  <div style={{ fontSize: "14px", fontWeight: 800 }}>{high}</div>
+                                  <div style={{ fontSize: "9px", color: "#86efac" }}>({comboCountRow[i]})</div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr style={{ background: "#fff" }}>
+                              <td style={{ padding: "10px 8px", fontWeight: 700, fontSize: "12px", color: POSITION_COLORS[nextPos], borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0" }}>
+                                {nextPos}
+                              </td>
+                              {PAT_HIGH_CARDS.map((high, i) => {
+                                const entry = tableData[high];
+                                const actionBg = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#dcfce7"
+                                    : entry.action === "CALL" ? "#dbeafe"
+                                      : entry.action.includes("MIX") || entry.action.includes("Call") ? "#fef3c7" : "#f1f5f9"
+                                  : "#f9fafb";
+                                const actionColor = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#166534"
+                                    : entry.action === "CALL" ? "#1e40af"
+                                      : "#92400e"
+                                  : "#cbd5e1";
+                                return (
+                                  <td key={high} style={{ padding: "6px 4px", textAlign: "center", borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none", borderBottom: "1px solid #e2e8f0" }}>
+                                    {entry ? (
+                                      <div>
+                                        <div style={{ fontWeight: 700, fontSize: "10px", color: "#1e293b", marginBottom: "1px" }}>{entry.label}</div>
+                                        <div style={{ fontSize: "12px", fontWeight: 800, color: entry.bb > 0.10 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626" }}>
+                                          {formatBB(entry.bb)} BB
+                                        </div>
+                                        <div style={{ fontSize: "9px", fontWeight: 600, marginTop: "1px", padding: "1px 3px", borderRadius: "3px", display: "inline-block", background: actionBg, color: actionColor }}>
+                                          {entry.action}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div style={{ color: "#cbd5e1", fontSize: "10px", fontStyle: "italic" }}>— fold all —</div>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
+
+                  {flowCategory === "two" && (() => {
+                    const tableData = getFlowTableData("two", TWO_HIGH_CARDS, TWO_RANK_COMBOS, makeRepresentativeTwoHand);
+                    if (!tableData) return null;
+                    const comboCountRow = TWO_HIGH_CARDS.map(h => TWO_RANK_COMBOS[h].length);
+                    return (
+                      <div style={{ overflowX: "auto", marginBottom: "16px" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
+                          <thead>
+                            <tr style={{ background: "#3b0764" }}>
+                              <th style={{ padding: "8px", color: "#94a3b8", fontSize: "10px", fontWeight: 700, textAlign: "left", borderRight: "1px solid #581c87", minWidth: "70px" }}>
+                                {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
+                              </th>
+                              {TWO_HIGH_CARDS.map((high, i) => (
+                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #581c87" : "none", minWidth: "72px" }}>
+                                  <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
+                                  <div style={{ fontSize: "9px", color: "#c4b5fd" }}>({comboCountRow[i]})</div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr style={{ background: "#fff" }}>
+                              <td style={{ padding: "10px 8px", fontWeight: 700, fontSize: "12px", color: POSITION_COLORS[nextPos], borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0" }}>
+                                {nextPos}
+                              </td>
+                              {TWO_HIGH_CARDS.map((high, i) => {
+                                const entry = tableData[high];
+                                const actionBg = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#dcfce7"
+                                    : entry.action === "CALL" ? "#dbeafe"
+                                      : entry.action.includes("MIX") || entry.action.includes("Call") ? "#fef3c7" : "#f1f5f9"
+                                  : "#f9fafb";
+                                const actionColor = entry
+                                  ? ["RAISE","3-BET","4-BET","5-BET"].includes(entry.action) ? "#166534"
+                                    : entry.action === "CALL" ? "#1e40af" : "#92400e"
+                                  : "#cbd5e1";
+                                return (
+                                  <td key={high} style={{ padding: "8px 4px", textAlign: "center", borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #e2e8f0" : "none", borderBottom: "1px solid #e2e8f0" }}>
+                                    {entry ? (
+                                      <div>
+                                        <div style={{ fontWeight: 700, fontSize: "10px", color: "#1e293b", marginBottom: "2px" }}>{entry.label}</div>
+                                        <div style={{ fontSize: "12px", fontWeight: 800, color: entry.bb > 0.05 ? "#16a34a" : entry.bb >= 0 ? "#ca8a04" : "#dc2626" }}>
+                                          {formatBB(entry.bb)} BB
+                                        </div>
+                                        <div style={{ fontSize: "9px", fontWeight: 600, marginTop: "2px", padding: "1px 4px", borderRadius: "3px", display: "inline-block", background: actionBg, color: actionColor }}>
+                                          {entry.action}
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div style={{ color: "#cbd5e1", fontSize: "10px", fontStyle: "italic" }}>— fold all —</div>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Action buttons */}
+                  <div style={{
+                    display: "flex", gap: "12px", justifyContent: "center",
+                    padding: "16px", background: "#f1f5f9", borderRadius: "10px"
+                  }}>
+                    <span style={{ fontSize: "13px", fontWeight: 700, color: "#64748b", alignSelf: "center" }}>
+                      {nextPos} action:
+                    </span>
+                    {availableActions.map(act => (
+                      <button key={act} onClick={() => handleAction(act)} style={actionBtnStyle(act)}>
+                        {act}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Completion state */}
+              {isComplete && actionHistory.length > 0 && (
+                <div style={{
+                  padding: "20px", textAlign: "center", background: "#f0fdf4",
+                  borderRadius: "10px", border: "1px solid #bbf7d0"
+                }}>
+                  <div style={{ fontSize: "16px", fontWeight: 700, color: "#166534", marginBottom: "8px" }}>
+                    Action Complete
+                  </div>
+                  <div style={{ fontSize: "13px", color: "#475569", marginBottom: "12px" }}>
+                    {actionHistory.filter(h => !h.reAction).map(h => `${h.pos}: ${h.action}`).join(" → ")}
+                    {actionHistory.filter(h => h.reAction).map(h => ` → ${h.pos}: ${h.action} (re-action)`).join("")}
+                  </div>
+                  <button onClick={() => setActionHistory([])} style={{
+                    padding: "8px 20px", borderRadius: "6px", border: "none",
+                    background: "#22c55e", color: "#fff", fontWeight: 700, cursor: "pointer"
+                  }}>
+                    Start New Sequence
+                  </button>
+                </div>
+              )}
+
+              {/* Empty state */}
+              {actionHistory.length === 0 && !nextPos && (
+                <div style={{ textAlign: "center", padding: "40px", color: "#94a3b8" }}>
+                  <div style={{ fontSize: "15px", fontWeight: 600 }}>Click an action for UTG to begin</div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ==================== RANGE STATS TAB ==================== */}
+        {activeTab === "stats" && (() => {
+          const stats = RANGE_STATS;
+          const pct = (n, total) => total > 0 ? (n / total * 100).toFixed(1) : "0.0";
+
+          return (
+            <div>
+              <div style={{
+                padding: "12px 16px", background: "#eff6ff", borderRadius: "8px",
+                marginBottom: "16px", fontSize: "13px", color: "#1e40af", lineHeight: 1.5
+              }}>
+                <strong>Range Stats:</strong> Percentages show what fraction of ALL dealt hands take each action.
+                Weighted by actual dealing frequency from C(52,4) = 270,725 possible hands
+                (pat 6.3%, tri 57.1%, two-card 35.5%, trash 1.1% of deals).
+              </div>
+
+              {/* View toggle */}
+              <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+                <button onClick={() => setStatsView("rfi")} style={{
+                  padding: "8px 18px", fontWeight: 600, fontSize: "13px", border: "2px solid", borderRadius: "8px", cursor: "pointer",
+                  borderColor: statsView === "rfi" ? "#6366f1" : "#cbd5e1",
+                  background: statsView === "rfi" ? "#6366f1" : "#f8fafc",
+                  color: statsView === "rfi" ? "#fff" : "#334155"
+                }}>
+                  RFI (Raise First In)
+                </button>
+                <button onClick={() => setStatsView("facing")} style={{
+                  padding: "8px 18px", fontWeight: 600, fontSize: "13px", border: "2px solid", borderRadius: "8px", cursor: "pointer",
+                  borderColor: statsView === "facing" ? "#6366f1" : "#cbd5e1",
+                  background: statsView === "facing" ? "#6366f1" : "#f8fafc",
+                  color: statsView === "facing" ? "#fff" : "#334155"
+                }}>
+                  Facing a Raise
+                </button>
+              </div>
+
+              {statsView === "rfi" && (
+                <div>
+                  {/* RFI definition */}
+                  <div style={{ background: "#f0f9ff", border: "1px solid #bae6fd", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", fontSize: "12px", color: "#0c4a6e", lineHeight: "1.5" }}>
+                    <strong>Open Rate</strong> = % of all dealt hands where you voluntarily enter the pot when folded to you.
+                    Calculated as: (Raise% + half of Mix% + Call%) of all possible deals.
+                    Mix hands are weighted at 50% since they play a mixed strategy. SB "Call" = completing the blind.
+                    Denominator includes all pats, tri-cards, two-cards, and trash hands (~11,280 weighted combos).
+                    BB is excluded — BB already has a forced blind and cannot open. BB only acts facing a raise (see Facing Raise tab).
+                  </div>
+                  {/* RFI summary table */}
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", border: "1px solid #e2e8f0" }}>
+                      <thead>
+                        <tr style={{ background: "#1e293b" }}>
+                          <th style={{ padding: "12px 10px", color: "#fff", textAlign: "left", borderRight: "1px solid #334155" }}>Position</th>
+                          <th style={{ padding: "12px 10px", color: "#22c55e", textAlign: "center", borderRight: "1px solid #334155" }}>Raise %</th>
+                          <th style={{ padding: "12px 10px", color: "#fbbf24", textAlign: "center", borderRight: "1px solid #334155" }}>Mix %</th>
+                          <th style={{ padding: "12px 10px", color: "#3b82f6", textAlign: "center", borderRight: "1px solid #334155" }}>Call %</th>
+                          <th style={{ padding: "12px 10px", color: "#ef4444", textAlign: "center", borderRight: "1px solid #334155" }}>Fold %</th>
+                          <th style={{ padding: "12px 10px", color: "#94a3b8", textAlign: "center" }}>Open Rate</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {POSITIONS.filter(p => p !== "BB").map((pos, idx) => {
+                          const s = stats[pos].rfi;
+                          const openPct = ((s.raise + s.mix * 0.5 + (pos === "SB" ? s.call : 0)) / s.total * 100).toFixed(1);
+                          return (
+                            <tr key={pos} style={{ background: idx % 2 === 0 ? "#fafafa" : "#fff" }}>
+                              <td style={{ padding: "12px 10px", fontWeight: 700, fontSize: "13px", color: POSITION_COLORS[pos], borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0" }}>
+                                {pos}{pos === "SB" ? " (complete/raise)" : ""}
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#16a34a" }}>
+                                {pct(s.raise, s.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#ca8a04" }}>
+                                {pct(s.mix, s.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#2563eb" }}>
+                                {pct(s.call, s.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#dc2626" }}>
+                                {pct(s.fold, s.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderBottom: "1px solid #e2e8f0" }}>
+                                <div style={{ fontWeight: 800, fontSize: "15px", color: "#1e293b" }}>{openPct}%</div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Visual bar chart */}
+                  <div style={{ marginTop: "20px" }}>
+                    <div style={{ fontSize: "14px", fontWeight: 700, color: "#1e293b", marginBottom: "12px" }}>
+                      Overall Open Rate by Position
+                    </div>
+                    {POSITIONS.filter(p => p !== "BB").map(pos => {
+                      const s = stats[pos].rfi;
+                      const raisePct = s.raise / s.total * 100;
+                      const mixPct = s.mix / s.total * 100;
+                      const callPct = (pos === "SB" ? s.call : 0) / s.total * 100;
+                      const totalOpenPct = ((s.raise + s.mix * 0.5 + (pos === "SB" ? s.call : 0)) / s.total * 100).toFixed(1);
+                      return (
+                        <div key={pos} style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+                          <div style={{ width: "36px", fontWeight: 700, fontSize: "12px", color: POSITION_COLORS[pos] }}>{pos}</div>
+                          <div style={{ flex: 1, height: "24px", background: "#f1f5f9", borderRadius: "4px", overflow: "hidden", display: "flex" }}>
+                            <div style={{ width: `${raisePct}%`, background: "#22c55e", height: "100%" }} title={`Raise: ${raisePct.toFixed(1)}%`}></div>
+                            <div style={{ width: `${mixPct}%`, background: "#fbbf24", height: "100%" }} title={`Mix: ${mixPct.toFixed(1)}%`}></div>
+                            <div style={{ width: `${callPct}%`, background: "#3b82f6", height: "100%" }} title={`Call: ${callPct.toFixed(1)}%`}></div>
+                          </div>
+                          <div style={{ width: "50px", fontSize: "13px", fontWeight: 800, color: "#1e293b", textAlign: "right" }}>{totalOpenPct}%</div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ display: "flex", gap: "16px", marginTop: "8px", fontSize: "11px", color: "#64748b" }}>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#22c55e", marginRight: "4px" }}></span>Raise</span>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#fbbf24", marginRight: "4px" }}></span>Mix</span>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#3b82f6", marginRight: "4px" }}></span>Call</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {statsView === "facing" && (
+                <div>
+                  {/* Opener selector */}
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px",
+                    padding: "12px 16px", background: "#fef3c7", borderRadius: "8px", border: "1px solid #fcd34d"
+                  }}>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#92400e", textTransform: "uppercase", letterSpacing: "1px" }}>
+                      Facing raise from:
+                    </span>
+                    {POSITIONS.filter(p => p !== "BB").map(pos => (
+                      <button key={pos} onClick={() => setStatsFacingOpener(pos)} style={{
+                        padding: "6px 14px", borderRadius: "6px", border: "2px solid",
+                        borderColor: statsFacingOpener === pos ? POSITION_COLORS[pos] : "#cbd5e1",
+                        background: statsFacingOpener === pos ? POSITION_COLORS[pos] : "#fff",
+                        color: statsFacingOpener === pos ? "#fff" : "#475569",
+                        fontWeight: 700, fontSize: "12px", cursor: "pointer"
+                      }}>
+                        {pos}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Facing raise stats table */}
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", border: "1px solid #e2e8f0" }}>
+                      <thead>
+                        <tr style={{ background: "#92400e" }}>
+                          <th style={{ padding: "12px 10px", color: "#fff", textAlign: "left", borderRight: "1px solid #b45309" }}>Position</th>
+                          <th style={{ padding: "12px 10px", color: "#86efac", textAlign: "center", borderRight: "1px solid #b45309" }}>3-Bet %</th>
+                          <th style={{ padding: "12px 10px", color: "#93c5fd", textAlign: "center", borderRight: "1px solid #b45309" }}>Call %</th>
+                          <th style={{ padding: "12px 10px", color: "#fcd34d", textAlign: "center", borderRight: "1px solid #b45309" }}>Mix Call %</th>
+                          <th style={{ padding: "12px 10px", color: "#fca5a5", textAlign: "center", borderRight: "1px solid #b45309" }}>Fold %</th>
+                          <th style={{ padding: "12px 10px", color: "#fff", textAlign: "center" }}>Defend Rate</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {POSITIONS.filter(p => POSITIONS.indexOf(p) > POSITIONS.indexOf(statsFacingOpener)).map((pos, idx) => {
+                          const fr = stats[pos].facing[statsFacingOpener];
+                          if (!fr) return null;
+                          const defendPct = ((fr.threeBet + fr.call + fr.mixCall * 0.5) / fr.total * 100);
+                          return (
+                            <tr key={pos} style={{ background: idx % 2 === 0 ? "#fafafa" : "#fff" }}>
+                              <td style={{ padding: "12px 10px", fontWeight: 700, color: POSITION_COLORS[pos], borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0" }}>
+                                {pos}
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#16a34a" }}>
+                                {pct(fr.threeBet, fr.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#2563eb" }}>
+                                {pct(fr.call, fr.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#ca8a04" }}>
+                                {pct(fr.mixCall, fr.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderRight: "1px solid #e2e8f0", borderBottom: "1px solid #e2e8f0", fontWeight: 700, color: "#dc2626" }}>
+                                {pct(fr.fold, fr.total)}%
+                              </td>
+                              <td style={{ padding: "12px 10px", textAlign: "center", borderBottom: "1px solid #e2e8f0" }}>
+                                <div style={{ fontWeight: 800, fontSize: "15px", color: "#1e293b" }}>{defendPct.toFixed(1)}%</div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Visual bars */}
+                  <div style={{ marginTop: "20px" }}>
+                    <div style={{ fontSize: "14px", fontWeight: 700, color: "#1e293b", marginBottom: "12px" }}>
+                      Defend Rate vs {statsFacingOpener} Raise
+                    </div>
+                    {POSITIONS.filter(p => POSITIONS.indexOf(p) > POSITIONS.indexOf(statsFacingOpener)).map(pos => {
+                      const fr = stats[pos].facing[statsFacingOpener];
+                      if (!fr) return null;
+                      const threeBetPct = fr.threeBet / fr.total * 100;
+                      const callPct = fr.call / fr.total * 100;
+                      const mixPct = fr.mixCall / fr.total * 100;
+                      const defendTotal = ((fr.threeBet + fr.call + fr.mixCall * 0.5) / fr.total * 100).toFixed(1);
+                      return (
+                        <div key={pos} style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "8px" }}>
+                          <div style={{ width: "36px", fontWeight: 700, fontSize: "12px", color: POSITION_COLORS[pos] }}>{pos}</div>
+                          <div style={{ flex: 1, height: "24px", background: "#f1f5f9", borderRadius: "4px", overflow: "hidden", display: "flex" }}>
+                            <div style={{ width: `${threeBetPct}%`, background: "#22c55e", height: "100%" }}></div>
+                            <div style={{ width: `${callPct}%`, background: "#3b82f6", height: "100%" }}></div>
+                            <div style={{ width: `${mixPct}%`, background: "#fbbf24", height: "100%" }}></div>
+                          </div>
+                          <div style={{ width: "50px", fontSize: "13px", fontWeight: 800, color: "#1e293b", textAlign: "right" }}>{defendTotal}%</div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ display: "flex", gap: "16px", marginTop: "8px", fontSize: "11px", color: "#64748b" }}>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#22c55e", marginRight: "4px" }}></span>3-Bet</span>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#3b82f6", marginRight: "4px" }}></span>Call</span>
+                      <span><span style={{ display: "inline-block", width: "10px", height: "10px", borderRadius: "2px", background: "#fbbf24", marginRight: "4px" }}></span>Mix Call/Fold</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+            </div>
+          );
+        })()}
+
+        {/* Penalties and Equity tabs removed — will integrate concepts differently later */}
+        {false && (
+          <div>
+            <div style={{
+              padding: "12px 16px", background: "#fef3c7", borderRadius: "8px",
+              marginBottom: "16px", fontSize: "13px", color: "#92400e", lineHeight: 1.5
+            }}>
+              <strong>Not all penalties are equal.</strong> When you have duplicate suits or pairs,
+              the specific cards you hold still matter enormously. Low cards (A-5) block opponents
+              from having strong hands and give you information for snowing later. High cards (Q, K)
+              block nothing useful and provide zero strategic information.
+            </div>
+
+            {penaltyData.map((ex, idx) => {
+              const evA = ex.evA;
+              const evB = ex.evB;
+              const diff = evA.ev - evB.ev;
+              return (
+                <div key={idx} style={{
+                  marginBottom: "18px", padding: "16px",
+                  border: "1px solid #e5e7eb", borderRadius: "10px", background: "#fafafa"
+                }}>
+                  {/* Section title */}
+                  <div style={{
+                    fontSize: "13px", fontWeight: 700, color: "#1e293b",
+                    marginBottom: "12px", paddingBottom: "8px", borderBottom: "1px solid #e5e7eb"
+                  }}>
+                    {ex.title}
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 40px 1fr", alignItems: "center", gap: "8px" }}>
+                    {/* Hand A — better */}
+                    <div style={{ padding: "10px", background: "#ecfdf5", borderRadius: "8px" }}>
+                      <div style={{ fontSize: "11px", fontWeight: 700, color: "#16a34a", marginBottom: "4px" }}>
+                        BETTER {ex.section === "same_penalty" ? "(same penalty)" : ""}
+                      </div>
+                      <div style={{ fontWeight: 700, fontSize: "13px", marginBottom: "4px" }}>{ex.handA.name}</div>
+                      <HandDisplay cards={ex.handA.cards} small />
+                      <div style={{ marginTop: "6px", fontSize: "13px" }}>
+                        <span style={{ fontWeight: 700 }}>{formatBB(toDisplayBB(evA.ev, selectedPosition))} BB</span>
+                        <span style={{ color: "#64748b", marginLeft: "6px", fontSize: "10px" }}>{evA.hand.label}</span>
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#64748b", marginTop: "2px" }}>
+                        block: {evA.blockerValue > 0 ? "+" : ""}{evA.blockerValue} · bluff: -{evA.bluffPenalty}
+                      </div>
+                    </div>
+
+                    <div style={{ textAlign: "center", fontSize: "16px", color: "#94a3b8", fontWeight: 700 }}>vs</div>
+
+                    {/* Hand B — worse */}
+                    <div style={{ padding: "10px", background: "#fef2f2", borderRadius: "8px" }}>
+                      <div style={{ fontSize: "11px", fontWeight: 700, color: "#dc2626", marginBottom: "4px" }}>
+                        WORSE {ex.section === "same_penalty" ? "(same penalty)" : ""}
+                      </div>
+                      <div style={{ fontWeight: 700, fontSize: "13px", marginBottom: "4px" }}>{ex.handB.name}</div>
+                      <HandDisplay cards={ex.handB.cards} small />
+                      <div style={{ marginTop: "6px", fontSize: "13px" }}>
+                        <span style={{ fontWeight: 700 }}>{formatBB(toDisplayBB(evB.ev, selectedPosition))} BB</span>
+                        <span style={{ color: "#64748b", marginLeft: "6px", fontSize: "10px" }}>{evB.hand.label}</span>
+                      </div>
+                      <div style={{ fontSize: "10px", color: "#64748b", marginTop: "2px" }}>
+                        block: {evB.blockerValue > 0 ? "+" : ""}{evB.blockerValue} · bluff: -{evB.bluffPenalty}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* BB difference bar */}
+                  <div style={{
+                    marginTop: "10px", display: "flex", alignItems: "center", gap: "10px"
+                  }}>
+                    {(() => {
+                      const bbA = toDisplayBB(evA.ev, selectedPosition);
+                      const bbB = toDisplayBB(evB.ev, selectedPosition);
+                      const bbDiff = bbA - bbB;
+                      return (
+                        <span style={{
+                          fontWeight: 800, fontSize: "14px",
+                          color: bbDiff > 0 ? "#16a34a" : "#dc2626"
+                        }}>
+                          Gap: {formatBB(bbDiff)} BB
+                        </span>
+                      );
+                    })()}
+                    <div style={{
+                      flex: 1, height: "6px", background: "#e5e7eb", borderRadius: "3px", overflow: "hidden"
+                    }}>
+                      <div style={{
+                        width: `${Math.min(Math.abs(diff) * 15, 100)}%`,
+                        height: "100%",
+                        background: diff > 0 ? "#22c55e" : "#ef4444",
+                        borderRadius: "3px"
+                      }} />
+                    </div>
+                  </div>
+
+                  {/* Explanation */}
+                  <div style={{
+                    marginTop: "10px", padding: "8px 12px",
+                    background: "#f0f9ff", borderRadius: "6px", border: "1px solid #bfdbfe",
+                    fontSize: "12px", color: "#1e40af", lineHeight: 1.5
+                  }}>
+                    {ex.explanation}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {false && (
+          <div>
+            <div style={{
+              padding: "12px 16px", background: "#eff6ff", borderRadius: "8px",
+              marginBottom: "16px", fontSize: "13px", color: "#1e40af", lineHeight: 1.5
+            }}>
+              Click any hand from the <strong>Hand Categories</strong> tab to select it, then view its equity
+              against a representative range. Equity accounts for badugi completion probability,
+              showdown value of unimproved hands, and hand quality distribution.
+            </div>
+
+            <div style={{ marginBottom: "16px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, color: "#64748b", marginBottom: "8px" }}>Select a hand to analyze:</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                {[...EXAMPLE_HANDS.pat, ...EXAMPLE_HANDS.tri, ...EXAMPLE_HANDS.two].map(h => (
+                  <button key={h.id} onClick={() => setEquityHand(h)} style={{
+                    padding: "6px 12px", borderRadius: "6px", border: "2px solid",
+                    borderColor: equityHand?.id === h.id ? "#6366f1" : "#e2e8f0",
+                    background: equityHand?.id === h.id ? "#eef2ff" : "#fff",
+                    cursor: "pointer", fontSize: "12px", fontWeight: 600
+                  }}>
+                    {h.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {equityHand ? (
+              <div>
+                <div style={{
+                  padding: "16px", background: "#fafafa",
+                  border: "1px solid #e5e7eb", borderRadius: "10px", marginBottom: "16px"
+                }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#64748b", marginBottom: "6px" }}>SELECTED HAND</div>
+                  <div style={{ fontWeight: 700, fontSize: "16px", marginBottom: "6px" }}>{equityHand.name}</div>
+                  <HandDisplay cards={equityHand.cards} />
+                </div>
+
+                <div style={{
+                  padding: "20px", borderRadius: "10px", textAlign: "center",
+                  background: equityResult > 55 ? "linear-gradient(135deg, #ecfdf5, #d1fae5)" :
+                    equityResult > 45 ? "linear-gradient(135deg, #fffbeb, #fef3c7)" :
+                      "linear-gradient(135deg, #fef2f2, #fecaca)",
+                  border: "2px solid",
+                  borderColor: equityResult > 55 ? "#86efac" : equityResult > 45 ? "#fcd34d" : "#fca5a5"
+                }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#64748b", marginBottom: "4px" }}>
+                    EQUITY vs RANGE ({selectedPosition})
+                  </div>
+                  <div style={{ fontSize: "48px", fontWeight: 800, color: "#1e293b" }}>
+                    {equityResult}%
+                  </div>
+                  <div style={{ fontSize: "13px", color: "#64748b", marginTop: "4px" }}>
+                    Against representative opening/defending range
+                  </div>
+                </div>
+
+                {/* Breakdown */}
+                <div style={{
+                  marginTop: "16px", padding: "14px", background: "#f8fafc",
+                  borderRadius: "8px", border: "1px solid #e2e8f0"
+                }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#64748b", marginBottom: "8px" }}>BREAKDOWN</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px", fontSize: "13px" }}>
+                    <div>
+                      <div style={{ color: "#64748b", fontSize: "11px" }}>Completion</div>
+                      <div style={{ fontWeight: 700 }}>{Math.round(calcCompletionProb(classifyHand(equityHand.cards), 3).prob * 100)}%</div>
+                    </div>
+                    <div>
+                      <div style={{ color: "#64748b", fontSize: "11px" }}>Blocker Value</div>
+                      <div style={{ fontWeight: 700 }}>{calcHandEV(equityHand.cards, selectedPosition).blockerValue}</div>
+                    </div>
+                    <div>
+                      <div style={{ color: "#64748b", fontSize: "11px" }}>Bluff Penalty</div>
+                      <div style={{ fontWeight: 700, color: "#dc2626" }}>-{calcHandEV(equityHand.cards, selectedPosition).bluffPenalty}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Range composition */}
+                <div style={{
+                  marginTop: "12px", padding: "14px", background: "#f8fafc",
+                  borderRadius: "8px", border: "1px solid #e2e8f0"
+                }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#64748b", marginBottom: "8px" }}>VILLAIN RANGE COMPOSITION</div>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    {[
+                      { label: "Pat Hands", count: EXAMPLE_HANDS.pat.length, color: "#22c55e" },
+                      { label: "Tri-Cards", count: EXAMPLE_HANDS.tri.length, color: "#3b82f6" },
+                      { label: "Two-Cards", count: EXAMPLE_HANDS.two.length, color: "#f59e0b" }
+                    ].map(r => (
+                      <div key={r.label} style={{
+                        padding: "6px 12px", borderRadius: "6px",
+                        background: r.color + "15", border: `1px solid ${r.color}40`,
+                        fontSize: "12px", fontWeight: 600, color: r.color
+                      }}>
+                        {r.label} ({r.count})
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div style={{
+                textAlign: "center", padding: "60px 20px", color: "#94a3b8"
+              }}>
+                <div style={{ fontSize: "40px", marginBottom: "12px" }}>🃏</div>
+                <div style={{ fontSize: "15px", fontWeight: 600 }}>No hand selected</div>
+                <div style={{ fontSize: "13px", marginTop: "4px" }}>
+                  Go to Hand Categories and click a hand to analyze its equity
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Footer note */}
+      <div style={{
+        textAlign: "center", padding: "16px", fontSize: "11px", color: "#94a3b8", marginTop: "12px"
+      }}>
+        Badugi 6-Max Limit Solver · Pre-First Draw · EVs are approximate and model-based ·
+        Factors: completion probability, showdown value, blocker effects, bluffability, position
+      </div>
+    </div>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(BadugiSolver));
+  </script>
+</body>
+</html>

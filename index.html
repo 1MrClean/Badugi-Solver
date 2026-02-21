@@ -17,7 +17,6 @@
   <div id="root"></div>
   <script type="text/babel">
     const { useState, useMemo, useCallback } = React;
-
 import { useState, useMemo, useCallback } from "react";
 
 // ============================================================
@@ -203,6 +202,137 @@ function getDrawPlan(cards) {
 }
 
 // ============================================================
+// CONDITIONAL DRAW DECISIONS (Position-Aware)
+// ============================================================
+// Key insight: when facing a raise, the optimal D1/D2 decision depends on
+// what opponent does on the draw — which you can SEE if you have position.
+// BTN/CO: act after opponent on draws → can condition D1/D2 on their action
+// SB/BB: act before opponent → must pick a default strategy blind
+//
+// Only applies to tris with a strong 2-card base hiding inside them.
+// e.g. A-3-T: keeping tri draws to mediocre T-high badugi,
+//      but breaking to A-3 draws to premium badugi (if you get there).
+
+function getConditionalDrawInfo(cards) {
+  const structural = classifyHand(cards);
+  if (structural.type !== "tri") return null;
+
+  const triHighVal = RANK_VALUES[structural.highCard];
+
+  // Find the best 2-card base from the tri cards
+  const triCards = structural.cards; // the 3 tri cards, sorted
+  const baseOptions = [];
+  for (let i = 0; i < triCards.length; i++) {
+    for (let j = i + 1; j < triCards.length; j++) {
+      if (triCards[i].suit !== triCards[j].suit) {
+        const pair = [triCards[i], triCards[j]].sort((a, b) => RANK_VALUES[a.rank] - RANK_VALUES[b.rank]);
+        const bHigh = RANK_VALUES[pair[1].rank];
+        baseOptions.push({ cards: pair, highVal: bHigh, sumVal: RANK_VALUES[pair[0].rank] + bHigh });
+      }
+    }
+  }
+  if (baseOptions.length === 0) return null;
+  baseOptions.sort((a, b) => a.sumVal - b.sumVal);
+  const bestBase = baseOptions[0];
+
+  // Only consider conditional strategy if base is decent (both cards ≤ 7)
+  if (bestBase.highVal > 7) return null;
+  // And tri high is mediocre+ (8+). Low tris should always D1.
+  if (triHighVal <= 7) return null;
+
+  const baseLabel = bestBase.cards.map(c => c.rank).join("-");
+  const d1Rate = 10 / 48; // ~21% per draw
+
+  // --- vs PAT opponent ---
+  // Need any badugi to compete. D1 has ~50% over 3 draws.
+  // High-card quality matters less (any made hand beats a draw if they break).
+  // But our T/J/Q/K-high badugi still loses to most pats in raiser's range.
+  // D2 from premium base: lower completion but MUCH better when you get there.
+  const triEquityVsPat = Math.max(0.10, 0.90 - triHighVal * 0.06);
+  const d1_3draw = 1 - Math.pow(1 - d1Rate, 3);
+  const d2_badRate = 0.10; // straight to badugi per draw round
+  const d2_triRate = 0.32; // improve to tri per draw round
+  const d2_thenD1 = 10 / 47;
+  const d2_3drawComplete = Math.min(0.45,
+    d2_badRate +
+    (1 - d2_badRate) * d2_triRate * (1 - Math.pow(1 - d2_thenD1, 2)) +
+    (1 - d2_badRate) * (1 - d2_triRate) * d2_badRate +
+    (1 - d2_badRate) * (1 - d2_triRate) * (1 - d2_badRate) * d2_triRate * d2_thenD1
+  );
+  const d2AvgHigh = Math.min(13, bestBase.highVal + 3);
+  const d2EquityVsPat = Math.max(0.15, 0.90 - d2AvgHigh * 0.06);
+
+  const evD1vsPat = d1_3draw * triEquityVsPat * 6;
+  const evD2vsPat = d2_3drawComplete * d2EquityVsPat * 6;
+  const vsPat = evD1vsPat >= evD2vsPat ? "D1" : "D2";
+
+  // --- vs TRI opponent (both D1) ---
+  // Both completing: our high card vs their ~5-7 high average from raiser's range.
+  // If we're T-high, we lose to 5,6,7,8,9-high completions = most of their range.
+  // Breaking to premium base: when we complete, we often beat their completion.
+  const avgOppTriHigh = 6;
+  const triVsTri = triHighVal <= avgOppTriHigh ? 0.65 :
+    Math.max(0.15, 0.65 - (triHighVal - avgOppTriHigh) * 0.12);
+  const d2VsTri = d2AvgHigh <= avgOppTriHigh ? 0.70 :
+    Math.max(0.20, 0.70 - (d2AvgHigh - avgOppTriHigh) * 0.10);
+
+  const evD1vsTri = d1_3draw * triVsTri * 6;
+  const evD2vsTri = d2_3drawComplete * d2VsTri * 6;
+  const vsTri = evD1vsTri >= evD2vsTri ? "D1" : "D2";
+
+  // --- vs D2 opponent ---
+  // They're weak. Always D1, we're way ahead.
+  const vsTwo = "D1";
+
+  // --- SB/OOP default (can't see opponent's action) ---
+  // Weight by actual opener range composition (not raw hand distribution).
+  // BTN opens ~44%: pats ~14% of that range, tris ~55%, twos ~31%.
+  // Earlier positions open tighter but still tri-heavy.
+  // Key insight: tris are the MAJORITY of any opener's range.
+  // If D2 is correct vs tris (55% of range), OOP default should lean D2.
+  const sbD1 = evD1vsPat * 0.14 + evD1vsTri * 0.55 + d1_3draw * 0.80 * 6 * 0.31;
+  const sbD2 = evD2vsPat * 0.14 + evD2vsTri * 0.55 + d2_3drawComplete * 0.70 * 6 * 0.31;
+  // Strategic override: if D2 is correct vs tris (55% of range) AND we have a
+  // premium base (high ≤ 5), OOP should default D2. The raw EV comparison is too
+  // close because D1 gets a small edge vs pats (14%) and twos (31%), but in practice:
+  // 1) We're OOP — being wrong vs the MAJORITY of range is much worse
+  // 2) A premium base after D2 gives us great equity in later draws
+  // 3) The D1 "edge" vs pats assumes we complete, but T-high completion loses anyway
+  const premiumBase = bestBase.highVal <= 5;
+  const oopDefault = (vsTri === "D2" && premiumBase) ? "D2" :
+    sbD1 >= sbD2 ? "D1" : "D2";
+
+  // Is this hand conditional (different vs pat and vs tri)?
+  const isConditional = vsPat !== vsTri;
+  // Does this hand benefit from breaking at all?
+  const alwaysD2 = vsPat === "D2" && vsTri === "D2";
+  const alwaysD1 = vsPat === "D1" && vsTri === "D1";
+
+  if (alwaysD1) return null; // no useful conditional info
+
+  return {
+    baseLabel,
+    baseHighVal: bestBase.highVal,
+    triHighVal,
+    vsPat,       // D1 or D2 vs pat opponent
+    vsTri,       // D1 or D2 vs tri opponent (D1)
+    vsTwo,       // always D1
+    oopDefault,  // SB/BB default when acting first
+    isConditional, // true if different strategy vs pat vs tri
+    alwaysD2,    // true if D2 in all scenarios
+    // For display:
+    ipLabel: isConditional
+      ? `D1 vs pat, D2 vs D1 (break to ${baseLabel})`
+      : alwaysD2
+        ? `D2 — break to ${baseLabel} base`
+        : `D1`,
+    oopLabel: oopDefault === "D2"
+      ? `D2 — break to ${baseLabel} (can't see opp action)`
+      : `D1 default (can't see opp action)`,
+  };
+}
+
+// ============================================================
 // EV CALCULATION ENGINE
 // ============================================================
 
@@ -351,6 +481,7 @@ function calcHandEV(cards, position) {
     hand,
     plan,
     completion,
+    originalCards: cards, // all 4 cards for conditional draw analysis
     blockerValue: Math.round(blockerValue * 100) / 100,
     infoValue: Math.round(infoValue * 100) / 100,
     bluffPenalty: Math.round(bluffPenalty * 100) / 100
@@ -682,59 +813,205 @@ function getFacingRaiseActions(position, openerPos, handEV, betLevel, callerCoun
     const triHighVal = RANK_VALUES[hand.highCard];
     const triBehind = playersBehind;
 
+    // SUB-QUALITY: lower cards determine how good this tri is WITHIN its high-card tier.
+    // A-4-T (lowerSum=5) is vastly better than 8-9-T (lowerSum=17) because:
+    //   1. Better completion: A-4-T completing → A-4-T-x (decent badugi)
+    //   2. Better breaking: A-4 base is an elite 2-card draw if needed
+    //   3. Better blockers: low cards block opponents' premium draws
+    // lowerSum = sum of RANK_VALUES of the two non-high tri cards (lower = better)
+    const triCards = hand.cards.filter(c => RANK_VALUES[c.rank] <= triHighVal);
+    const sortedVals = triCards.map(c => RANK_VALUES[c.rank]).sort((a, b) => a - b);
+    const lowerSum = sortedVals.slice(0, 2).reduce((s, v) => s + v, 0);
+    // lowerSum range: best = 3 (A+2), worst ≈ triHighVal*2-3
+    // Normalize to 0-1 scale where 0 = best possible, 1 = worst possible
+    const minLower = 3; // A(1) + 2(2) = 3
+    const maxLower = (triHighVal - 1) + (triHighVal - 2); // worst two cards below high
+    const qualityPct = maxLower > minLower ? Math.max(0, Math.min(1, (lowerSum - minLower) / (maxLower - minLower))) : 0;
+    // qualityPct: 0 = best (A-2-x), 1 = worst (adjacent cards like 8-9-T)
+    // qualityBonus: +15 for best hands, -15 for worst (shifts 3-bet% up/down)
+    const qualityBonus = Math.round((1 - qualityPct) * 15 - qualityPct * 15);
+    const lowerLabel = sortedVals.slice(0, 2).map(v => {
+      const r = Object.entries(RANK_VALUES).find(([_, val]) => val === v);
+      return r ? r[0] : v;
+    }).join("-");
+
+    // Helper to clamp a percentage to 0-100
+    const clamp = (v) => Math.max(0, Math.min(100, Math.round(v)));
+
+    // CONDITIONAL DRAW INFO: compute position-aware D1/D2 strategy
+    // IP positions (BTN, CO when opener is UTG/HJ) act AFTER opponent on draws
+    // OOP positions (SB, BB, or anyone acting before raiser) act BEFORE
+    const condDraw = handEV.originalCards ? getConditionalDrawInfo(handEV.originalCards) : null;
+    const isIPOnDraw = posIdx >= POSITIONS.indexOf(openerPos); // true if we act after opener on draws
+    const drawLabel = condDraw
+      ? (isIPOnDraw ? ` | Draw: ${condDraw.ipLabel}` : ` | Draw: ${condDraw.oopLabel}`)
+      : "";
+
+    // RECLASSIFICATION REDIRECT: if this tri should be played as a two-card draw
+    // (alwaysD2, or OOP with D2 default, or J+ high tri), skip the entire tri
+    // evaluation and use two-card logic instead. This prevents absurd results like
+    // J-high tri with A-4 base folding while naked A-4 two-card defends.
+    // J+ HIGH ELIMINATION: completing to J/Q/K-high badugi is so weak against any
+    // raiser's range that you're virtually always better off D2'ing to your base.
+    // Even from IP, the conditional D1-vs-pat play is nearly worthless at J+ high.
+    const shouldReclassify = condDraw && (
+      condDraw.alwaysD2 ||
+      (!isIPOnDraw && condDraw.oopDefault === "D2") ||
+      triHighVal >= 11  // J+ high tris: always reclassify when decent base exists
+    );
+
+    if (shouldReclassify) {
+      // Evaluate as two-card draw using the base high card
+      const baseHighVal = condDraw.baseHighVal;
+      const baseLabel = condDraw.baseLabel;
+
+      // MULTIWAY QUALITY GATE for reclassified two-card
+      if (callers >= 1) {
+        if (baseHighVal >= 8) return { action: "FOLD", color: "#ef4444", detail: `Fold — D2 to ${baseLabel} base, ${baseHighVal}-high completion worthless multiway`, mix: { FOLD: 100 }, reclassifyAsTwo: true, reclassifyBase: baseLabel, reclassifyBaseHigh: baseHighVal, drawPlan: condDraw, isIPOnDraw };
+        if (baseHighVal >= 6) {
+          const hasAce = handEV.originalCards.some(c => c.rank === "A");
+          const hasDeuce = handEV.originalCards.some(c => c.rank === "2");
+          if (!hasAce && !hasDeuce) return { action: "FOLD", color: "#ef4444", detail: `Fold — D2 to ${baseLabel}, ${baseHighVal}-high w/o A or 2 too weak multiway`, mix: { FOLD: 100 }, reclassifyAsTwo: true, reclassifyBase: baseLabel, reclassifyBaseHigh: baseHighVal, drawPlan: condDraw, isIPOnDraw };
+        }
+        if (callers >= 2 && baseHighVal >= 6) return { action: "FOLD", color: "#ef4444", detail: `Fold — D2 to ${baseLabel}, can't beat ${1 + callers} ranges`, mix: { FOLD: 100 }, reclassifyAsTwo: true, reclassifyBase: baseLabel, reclassifyBaseHigh: baseHighVal, drawPlan: condDraw, isIPOnDraw };
+      }
+
+      // Two-card thresholds using base quality
+      const squeezeAdj = playersBehind * 0.35 + callers * 0.5;
+      const twoCallThreshold = 2.5 + squeezeAdj;
+      const twoMixThreshold = 2.0 + squeezeAdj;
+      const callersNote = callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : "";
+      const behindNote = playersBehind ? `, ${playersBehind} behind` : "";
+      // Use EV from base quality — lower base = better. Map baseHighVal to approx EV.
+      // A-2 (high 2) → ~4.5 EV, A-5 (high 5) → ~3.2 EV, 3-7 (high 7) → ~2.2 EV
+      const baseEV = Math.max(1.5, 5.0 - (baseHighVal - 2) * 0.55);
+
+      let result;
+      if (baseEV > twoCallThreshold)
+        result = { action: "CALL", color: "#3b82f6", detail: `D2 to ${baseLabel} base — call${callersNote || ` (${playersBehind} behind)`}`, mix: { CALL: 100 } };
+      else if (baseEV > twoMixThreshold)
+        result = { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `D2 to ${baseLabel} base — marginal${callersNote || ` (${playersBehind} behind)`}`, mix: { CALL: 60, FOLD: 40 } };
+      else
+        result = { action: "FOLD", color: "#ef4444", detail: `Fold — D2 to ${baseLabel} too weak${callers ? " multiway" : ""}`, mix: { FOLD: 100 } };
+
+      // Add 3-bet component for continuing hands (anti-exploit floor)
+      if (result.action !== "FOLD") {
+        const bet3 = 3;
+        if (result.mix.CALL) result.mix.CALL = Math.max(0, result.mix.CALL - bet3);
+        result.mix["3-BET"] = bet3;
+        result.detail += ` | 3-bet ${bet3}%`;
+      }
+
+      result.reclassifyAsTwo = true;
+      result.reclassifyBase = baseLabel;
+      result.reclassifyBaseHigh = baseHighVal;
+      result.drawPlan = condDraw;
+      result.isIPOnDraw = isIPOnDraw;
+      return result;
+    }
+
+    // Helper: append draw plan to any tri result before returning
+    const withDrawPlan = (result) => {
+      if (condDraw && result.action !== "FOLD") {
+        result.detail = result.detail + drawLabel;
+        result.drawPlan = condDraw;
+        result.isIPOnDraw = isIPOnDraw;
+      }
+      return result;
+    };
+
     // MULTIWAY DRAWING COST GATE: unchanged — multiway math overwhelms deception
     if (callers >= 2 && triHighVal >= 8)
-      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri can't profitably draw vs ${1 + callers} opponents across 3 streets`, mix: { FOLD: 100 } };
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri (${lowerLabel}) can't profitably draw vs ${1 + callers} opponents`, mix: { FOLD: 100 } };
     if (callers >= 1 && triHighVal >= 9)
-      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri, drawing cost too high multiway`, mix: { FOLD: 100 } };
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri (${lowerLabel}), drawing cost too high multiway`, mix: { FOLD: 100 } };
 
     const triCallMax = 8 - Math.floor(triBehind * 0.5) - callers;
     const triMixMax = triCallMax + Math.max(1, 2 - callers);
 
     // MIXED FREQUENCY STRATEGY (heads-up, no callers):
-    // Premium tris (3-4 high): mostly 3-bet, but call ~25% to protect calling range
-    // 5-high tri: balanced mix — 3-bet 50%, call 50%
-    // 6-high tri: mostly call, 3-bet ~20% for deception
-    // 7-high tri: almost always call, rare 3-bet ~10%
-    // 8+ high: call or fold based on position, no 3-bet
+    // Base rates by high card tier, then adjusted ±15% by sub-quality.
+    // ANTI-EXPLOIT FLOOR: every continuing hand 3-bets at least 3% to prevent
+    // opponents from knowing "this caller never has a 3-bet hand."
+    // Without this floor, opponents can exploit by knowing our call range is capped.
+    const MIN_3BET = 3; // minimum 3-bet frequency for any continuing hand
     if (callers === 0) {
       if (triHighVal <= 3) {
-        return { action: "3-BET", color: "#22c55e", detail: "Near-nut tri — 3-bet 75%, call 25% (protect calling range)", mix: { "3-BET": 75, CALL: 25 } };
+        const bet3 = clamp(75 + qualityBonus);
+        return withDrawPlan({ action: "3-BET", color: "#22c55e", detail: `Near-nut tri (${lowerLabel}-${hand.highCard}) — 3-bet ${bet3}%, call ${100 - bet3}%`, mix: { "3-BET": bet3, CALL: 100 - bet3 } });
       }
       if (triHighVal <= 4) {
-        return { action: "3-BET", color: "#22c55e", detail: "Premium tri — 3-bet 65%, call 35% (balance both ranges)", mix: { "3-BET": 65, CALL: 35 } };
+        const bet3 = clamp(65 + qualityBonus);
+        return withDrawPlan({ action: bet3 >= 50 ? "3-BET" : "MIX (3-BET/Call)", color: bet3 >= 50 ? "#22c55e" : "#a855f7", detail: `Premium tri (${lowerLabel}-${hand.highCard}) — 3-bet ${bet3}%, call ${100 - bet3}%`, mix: { "3-BET": bet3, CALL: 100 - bet3 } });
       }
       if (triHighVal <= 5) {
-        return { action: "MIX (3-BET/Call)", color: "#a855f7", detail: "Strong tri — 3-bet 45%, call 55% (key mixing hand)", mix: { "3-BET": 45, CALL: 55 } };
+        const bet3 = Math.max(MIN_3BET, clamp(45 + qualityBonus));
+        const action = bet3 >= 50 ? "3-BET" : bet3 >= 25 ? "MIX (3-BET/Call)" : "CALL";
+        const color = bet3 >= 50 ? "#22c55e" : bet3 >= 25 ? "#a855f7" : "#3b82f6";
+        return withDrawPlan({ action, color, detail: `Strong tri (${lowerLabel}-${hand.highCard}) — 3-bet ${bet3}%, call ${100 - bet3}%`, mix: { "3-BET": bet3, CALL: 100 - bet3 } });
       }
       if (triHighVal <= 6 && triBehind <= 3) {
-        return { action: "CALL", color: "#3b82f6", detail: "Good tri — call 80%, 3-bet 20% for deception", mix: { "3-BET": 20, CALL: 80 } };
+        const bet3 = Math.max(MIN_3BET, clamp(20 + qualityBonus));
+        const callPct = 100 - bet3;
+        const action = bet3 >= 35 ? "MIX (3-BET/Call)" : "CALL";
+        const color = bet3 >= 35 ? "#a855f7" : "#3b82f6";
+        return withDrawPlan({ action, color, detail: `Good tri (${lowerLabel}-${hand.highCard}) — 3-bet ${bet3}%, call ${callPct}%`, mix: { "3-BET": bet3, CALL: callPct } });
       }
       if (triHighVal <= 7 && triBehind <= 2) {
-        return { action: "CALL", color: "#3b82f6", detail: `Decent tri — call 90%, rare 3-bet 10%`, mix: { "3-BET": 10, CALL: 90 } };
+        const bet3 = Math.max(MIN_3BET, clamp(10 + qualityBonus));
+        const callPct = 100 - bet3;
+        const action = bet3 >= 25 ? "MIX (3-BET/Call)" : "CALL";
+        const color = bet3 >= 25 ? "#a855f7" : "#3b82f6";
+        return withDrawPlan({ action, color, detail: `Decent tri (${lowerLabel}-${hand.highCard}) — 3-bet ${bet3}%, call ${callPct}%`, mix: { "3-BET": bet3, CALL: callPct } });
       }
       if (triHighVal <= triCallMax) {
-        return { action: "CALL", color: "#3b82f6", detail: `Medium tri — call, ${triBehind} behind`, mix: { CALL: 100 } };
+        // Marginal calling hands — quality affects call vs fold mix
+        // Anti-exploit: even these hands 3-bet at MIN_3BET frequency
+        const rawCallPct = clamp(80 + qualityBonus);
+        const bet3 = MIN_3BET;
+        const callPct = rawCallPct - bet3;
+        const foldPct = 100 - rawCallPct;
+        if (foldPct <= 0) return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Medium tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, 3-bet ${bet3}%`, mix: { "3-BET": bet3, CALL: callPct } });
+        return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Medium tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, 3-bet ${bet3}%, fold ${foldPct}%`, mix: { "3-BET": bet3, CALL: callPct, FOLD: foldPct } });
       }
       if (triHighVal <= triMixMax) {
-        return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal tri — ${triBehind} behind`, mix: { CALL: 50, FOLD: 50 } };
+        // Borderline hands — quality shifts toward call or fold
+        const rawCallPct = clamp(50 + qualityBonus);
+        if (rawCallPct <= 20) return withDrawPlan({ action: "FOLD", color: "#ef4444", detail: `Weak tri (${lowerLabel}-${hand.highCard}) — fold ${100 - rawCallPct}%, call ${rawCallPct}%`, mix: { CALL: rawCallPct, FOLD: 100 - rawCallPct } });
+        const bet3 = MIN_3BET;
+        const callPct = rawCallPct - bet3;
+        const foldPct = 100 - rawCallPct;
+        if (rawCallPct >= 70) return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Marginal tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, 3-bet ${bet3}%, fold ${foldPct}% (good kickers)`, mix: { "3-BET": bet3, CALL: callPct, FOLD: foldPct } });
+        return withDrawPlan({ action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, 3-bet ${bet3}%, fold ${foldPct}%`, mix: { "3-BET": bet3, CALL: callPct, FOLD: foldPct } });
       }
-      return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold, ${triBehind} behind`, mix: { FOLD: 100 } };
+      // Below triMixMax: still check if premium lower cards rescue it
+      if (qualityBonus >= 10) {
+        return withDrawPlan({ action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Weak tri but premium kickers (${lowerLabel}-${hand.highCard}) — call 27%, 3-bet ${MIN_3BET}%, fold 70%`, mix: { "3-BET": MIN_3BET, CALL: 27, FOLD: 70 } });
+      }
+      return withDrawPlan({ action: "FOLD", color: "#ef4444", detail: `Weak tri (${lowerLabel}-${hand.highCard}) — fold, ${triBehind} behind`, mix: { FOLD: 100 } });
     }
 
     // MULTIWAY (1+ callers): 3-betting is less effective (harder to isolate).
-    // Premium tris still 3-bet sometimes to build pot with strong draws.
+    // Premium tris still 3-bet sometimes — quality adjusts frequency.
     if (triHighVal <= 4) {
-      return { action: "CALL", color: "#3b82f6", detail: `Premium tri — call multiway (3-bet less effective, ${callers} caller${callers > 1 ? "s" : ""})`, mix: { "3-BET": 20, CALL: 80 } };
+      const bet3 = clamp(20 + Math.round(qualityBonus * 0.5));
+      return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Premium tri (${lowerLabel}-${hand.highCard}) — call${bet3 > 0 ? ` ${100 - bet3}%, 3-bet ${bet3}%` : ""}, ${callers} caller${callers > 1 ? "s" : ""}`, mix: bet3 > 0 ? { "3-BET": bet3, CALL: 100 - bet3 } : { CALL: 100 } });
     }
     if (triHighVal <= 5) {
-      return { action: "CALL", color: "#3b82f6", detail: `Strong tri — call, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { CALL: 100 } };
+      const callPct = clamp(90 + Math.round(qualityBonus * 0.5));
+      return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Strong tri (${lowerLabel}-${hand.highCard}) — call, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { CALL: callPct, FOLD: 100 - callPct } });
     }
-    if (triHighVal <= triCallMax)
-      return { action: "CALL", color: "#3b82f6", detail: `Good tri — call${callers ? `, tighter w/ ${callers} caller${callers > 1 ? "s" : ""}` : ""}`, mix: { CALL: 100 } };
-    if (triHighVal <= triMixMax)
-      return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Medium tri — ${callers ? `${callers} caller${callers > 1 ? "s" : ""} + ` : ""}${triBehind} behind`, mix: { CALL: 50, FOLD: 50 } };
-    return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold${callers ? `, ${callers} caller${callers > 1 ? "s" : ""} ahead` : `, ${triBehind} behind`}`, mix: { FOLD: 100 } };
+    if (triHighVal <= triCallMax) {
+      const callPct = clamp(80 + qualityBonus);
+      if (callPct >= 70) return withDrawPlan({ action: "CALL", color: "#3b82f6", detail: `Good tri (${lowerLabel}-${hand.highCard}) — call${callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : ""}`, mix: { CALL: callPct, FOLD: 100 - callPct } });
+      return withDrawPlan({ action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, fold ${100 - callPct}%, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { CALL: callPct, FOLD: 100 - callPct } });
+    }
+    if (triHighVal <= triMixMax) {
+      const callPct = clamp(40 + qualityBonus);
+      if (callPct <= 15) return withDrawPlan({ action: "FOLD", color: "#ef4444", detail: `Weak tri (${lowerLabel}-${hand.highCard}) — fold, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { FOLD: 100 } });
+      return withDrawPlan({ action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Medium tri (${lowerLabel}-${hand.highCard}) — call ${callPct}%, fold ${100 - callPct}%, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { CALL: callPct, FOLD: 100 - callPct } });
+    }
+    return withDrawPlan({ action: "FOLD", color: "#ef4444", detail: `Weak tri (${lowerLabel}-${hand.highCard}) — fold${callers ? `, ${callers} caller${callers > 1 ? "s" : ""} ahead` : `, ${triBehind} behind`}`, mix: { FOLD: 100 } });
   }
 
   // Two-card vs single raise: multiway quality gate + threshold adjustments.
@@ -1419,6 +1696,10 @@ export default function BadugiSolver() {
         action: action.action,
         detail: action.detail || "",
         mix: action.mix || null,
+        drawPlan: action.drawPlan || null,
+        isIPOnDraw: action.isIPOnDraw || false,
+        reclassifyAsTwo: action.reclassifyAsTwo || false,
+        reclassifyBase: action.reclassifyBase || null,
         label: ranks.join("-") + (category !== "two" ? "r" : "")
       };
     }).sort((a, b) => b.ev - a.ev); // best first
@@ -1471,7 +1752,25 @@ export default function BadugiSolver() {
         </div>
 
         {displayPositions.map(pos => {
-          const allCombos = getAllCombosForColumn(category, high, pos, isFlowTab, flowContext);
+          let allCombos = getAllCombosForColumn(category, high, pos, isFlowTab, flowContext);
+          const isFacingRaiseCtx = isFlowTab ? !flowContext?.isRFI : facingRaise;
+          // Reclassify: in tri category, filter out always-D2 hands (they belong in two-card)
+          // In two category, we'll add reclassified tris separately (see below)
+          if (category === "tri" && isFacingRaiseCtx) {
+            const reclassified = allCombos.filter(c => c.reclassifyAsTwo);
+            allCombos = allCombos.filter(c => !c.reclassifyAsTwo);
+            if (reclassified.length > 0 && allCombos.length === 0) {
+              // All combos reclassified — show note instead of empty
+              return (
+                <div key={pos} style={{ borderBottom: `1px solid ${colors.border}`, padding: "8px 16px" }}>
+                  <span style={{ fontWeight: 800, fontSize: "13px", color: POSITION_COLORS[pos], marginRight: "8px" }}>{pos}</span>
+                  <span style={{ fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
+                    All {high}-high tris reclassified as 2-card draws (always D2 to {reclassified[0].reclassifyBase} base) — see Two-Card table
+                  </span>
+                </div>
+              );
+            }
+          }
           const opens = allCombos.filter(c => c.action !== "FOLD");
           const folds = allCombos.filter(c => c.action === "FOLD");
 
@@ -1550,6 +1849,25 @@ export default function BadugiSolver() {
                           {combo.action}
                         </div>
                       )}
+                      {combo.drawPlan && !isFold && (
+                        <div style={{
+                          marginTop: "3px", padding: "2px 4px", borderRadius: "3px",
+                          background: combo.drawPlan.isConditional ? "#fef3c7" : combo.drawPlan.alwaysD2 ? "#e0e7ff" : "#f1f5f9",
+                          border: `1px solid ${combo.drawPlan.isConditional ? "#fde68a" : combo.drawPlan.alwaysD2 ? "#c7d2fe" : "#e2e8f0"}`,
+                          fontSize: "7px", fontWeight: 700, lineHeight: "1.3",
+                          color: combo.drawPlan.isConditional ? "#92400e" : combo.drawPlan.alwaysD2 ? "#3730a3" : "#64748b"
+                        }}>
+                          {combo.isIPOnDraw ? (
+                            combo.drawPlan.isConditional ? (
+                              <span>D1 vs pat | D2 vs D1 → {combo.drawPlan.baseLabel}</span>
+                            ) : (
+                              <span>D2 → {combo.drawPlan.baseLabel} base</span>
+                            )
+                          ) : (
+                            <span>{combo.drawPlan.oopDefault} {combo.drawPlan.oopDefault === "D2" ? `→ ${combo.drawPlan.baseLabel}` : "(OOP default)"}</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1557,6 +1875,70 @@ export default function BadugiSolver() {
             </div>
           );
         })}
+
+        {/* For two-card category: show reclassified tris (always-D2 hands) */}
+        {category === "two" && (isFlowTab ? !flowContext?.isRFI : facingRaise) && (() => {
+          // Find tri combos that reclassify as two-card for this high card
+          // A tri like A-4-J with base A-4 (baseHigh=4) shows in two-card "4" column
+          const reclassifiedCombos = [];
+          const highVal = RANK_VALUES[high] || parseInt(high);
+          displayPositions.forEach(pos => {
+            // Check all tri high cards for combos that reclassify with this base high
+            TRI_HIGH_CARDS.forEach(triHigh => {
+              const triCombos = getAllCombosForColumn("tri", triHigh, pos, isFlowTab, flowContext);
+              triCombos.forEach(c => {
+                if (c.reclassifyAsTwo && c.drawPlan && c.drawPlan.baseHighVal === highVal) {
+                  reclassifiedCombos.push({ ...c, pos, fromTri: triHigh });
+                }
+              });
+            });
+          });
+          if (reclassifiedCombos.length === 0) return null;
+          // Group by position
+          const byPos = {};
+          reclassifiedCombos.forEach(c => {
+            if (!byPos[c.pos]) byPos[c.pos] = [];
+            byPos[c.pos].push(c);
+          });
+          return (
+            <div style={{ borderTop: `2px dashed ${colors.accent}`, marginTop: "4px" }}>
+              <div style={{ padding: "6px 16px", background: "#fefce8", fontSize: "11px", fontWeight: 700, color: "#854d0e" }}>
+                Reclassified Tris → {high}-high base (always D2)
+              </div>
+              {Object.entries(byPos).map(([pos, combos]) => (
+                <div key={pos} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                  <div style={{ padding: "6px 16px", background: colors.lightBg, display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontWeight: 800, fontSize: "13px", color: POSITION_COLORS[pos], minWidth: "32px" }}>{pos}</span>
+                    <span style={{ fontSize: "10px", color: "#64748b" }}>
+                      {combos.length} tri{combos.length > 1 ? "s" : ""} reclassified as D2 to {high} base
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", padding: "8px 16px 12px" }}>
+                    {combos.map((combo, idx) => {
+                      const is3bet = ["3-BET","4-BET","5-BET","RAISE"].includes(combo.action);
+                      const isCall = combo.action === "CALL";
+                      return (
+                        <div key={idx} style={{
+                          padding: "5px 8px", borderRadius: "6px", minWidth: "80px", textAlign: "center",
+                          background: "#fefce8", border: "1px solid #fde68a"
+                        }} title={combo.detail}>
+                          <div style={{ fontWeight: 700, fontSize: "11px", color: "#1e293b" }}>{combo.label}</div>
+                          <div style={{ fontSize: "9px", color: "#854d0e", fontWeight: 600 }}>was {combo.fromTri}-high tri</div>
+                          <div style={{ fontSize: "11px", fontWeight: 800, marginTop: "1px", color: combo.bb > 0.05 ? "#16a34a" : combo.bb >= 0 ? "#ca8a04" : "#dc2626" }}>
+                            {formatBB(combo.bb)} BB
+                          </div>
+                          <div style={{ fontSize: "8px", fontWeight: 700, marginTop: "2px", color: is3bet ? "#166534" : isCall ? "#1e40af" : "#92400e" }}>
+                            {combo.action} → D2
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
       </div>
     );
   };
@@ -3083,8 +3465,8 @@ export default function BadugiSolver() {
   );
 }
 
-    const root = ReactDOM.createRoot(document.getElementById("root"));
-    root.render(React.createElement(BadugiSolver));
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<BadugiSolver />);
   </script>
 </body>
 </html>

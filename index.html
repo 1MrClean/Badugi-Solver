@@ -18,6 +18,8 @@
   <script type="text/babel">
     const { useState, useMemo, useCallback } = React;
 
+import { useState, useMemo, useCallback } from "react";
+
 // ============================================================
 // BADUGI 6-MAX LIMIT SOLVER — Pre-First Draw
 // ============================================================
@@ -645,60 +647,94 @@ function getFacingRaiseActions(position, openerPos, handEV, betLevel, callerCoun
   const callerAdj = callers * 0.5; // each caller tightens thresholds significantly
 
   // Pat hands vs single raise:
-  // KEY INSIGHT: Flatting a pat makes your hand face-up. Everyone knows you have a mediocre made hand.
-  // All pats that continue should 3-bet — it preserves initiative and hides hand strength.
-  // Only pats with good equity/visibility should continue at all.
-  // Multiway: even worse. Overcalling KQJ8r is lighting money on fire — terrible visibility,
-  // no improvement path, opponents know exactly what you have.
+  // RANGE DECEPTION: If we always 3-bet pats and never call, our calling range is 100% draws.
+  // Opponent knows: "he called → no made hand" and can exploit on later streets.
+  // Solution: Strong pats mostly 3-bet but sometimes call to protect calling range.
+  // Medium pats mix 3-bet/fold. Weak pats fold.
   if (effectiveType === "pat") {
-    const pat3betThresh = 3.5 + callers * 0.4; // 3.5 heads-up, 3.9 w/ 1 caller, 4.3 w/ 2
-    if (ev >= pat3betThresh) return { action: "3-BET", color: "#22c55e", detail: `Pat — 3-bet (preserves initiative + hides strength)${callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : ""}` };
-    // Marginal pats: 3-bet at a frequency or fold. Never flat — flatting is face-up.
-    if (ev >= pat3betThresh - 0.5) return { action: "MIX (3-BET/Fold)", color: "#fbbf24", detail: `Marginal pat — mix 3-bet/fold, never flat (face-up)${callers ? `, ${callers} in pot` : ""}` };
-    return { action: "FOLD", color: "#ef4444", detail: `Weak pat — fold${callers ? `, multiway too strong` : ""}, no visibility, can't improve` };
+    const pat3betThresh = 3.5 + callers * 0.4;
+    if (ev >= pat3betThresh + 1.0) {
+      // Premium pats: 3-bet 80%, call 20% to protect calling range
+      return { action: "3-BET", color: "#22c55e", detail: `Strong pat — 3-bet 80%, call 20% (protect calling range)${callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : ""}`, mix: { "3-BET": 80, CALL: 20 } };
+    }
+    if (ev >= pat3betThresh) {
+      // Medium pats: 3-bet 60%, call 40%. These are the key deception hands.
+      return { action: "3-BET", color: "#22c55e", detail: `Medium pat — 3-bet 60%, call 40% (balanced)${callers ? `, ${callers} caller${callers > 1 ? "s" : ""}` : ""}`, mix: { "3-BET": 60, CALL: 40 } };
+    }
+    if (ev >= pat3betThresh - 0.5) {
+      return { action: "MIX (3-BET/Fold)", color: "#fbbf24", detail: `Marginal pat — 3-bet 40%, fold 60%${callers ? `, ${callers} in pot` : ""}`, mix: { "3-BET": 40, FOLD: 60 } };
+    }
+    return { action: "FOLD", color: "#ef4444", detail: `Weak pat — fold${callers ? `, multiway too strong` : ""}, no visibility, can't improve`, mix: { FOLD: 100 } };
   }
 
   // Tri-card vs single raise: players behind, callers, AND post-draw playability all matter.
   //
-  // KEY INSIGHT: A completed 9-high badugi is actually decent at showdown — it beats many badugis.
-  // The problem is the JOURNEY. A 9-high tri facing multiple opponents across 3 drawing rounds:
-  //   - Each draw round: opponents bet, you call while behind (drawing 1)
-  //   - If you miss: you're stuck with a tri, losing to all pats and completed badugis
-  //   - If you hit: your 9-high badugi is fine, but you've already paid 3 streets of multiway bets
-  //   - Opponents with pats bet every street for value; opponents with premium tris draw to better
-  //   - The COST of drawing multiway (facing bets from 2+ opponents per street) overwhelms
-  //     the showdown value of your completion
+  // RANGE DECEPTION: A pure strategy (always 3-bet premiums, always call mediums) is exploitable.
+  // Opponent knows: "he called and draws 1 → capped at 6-8 high tri, never premium."
+  // Then they stand pat with weak badugis or barrel later draws knowing our range.
   //
-  // So the multiway penalty isn't about completed hand quality — it's about the EV of the
-  // whole drawing process against multiple betting opponents.
+  // Solution: MIXED FREQUENCIES. Premium tris sometimes call (protecting call range).
+  // Medium tris sometimes 3-bet (preventing opponents from reading our 3-bet as always nutted).
+  // This makes both ranges harder to exploit on later drawing streets.
+  //
+  // Multiway adjustments still apply — drawing cost overwhelms deception benefits.
   if (effectiveType === "tri") {
     const triHighVal = RANK_VALUES[hand.highCard];
     const triBehind = playersBehind;
 
-    // MULTIWAY DRAWING COST GATE:
-    // With 2+ callers: marginal tris (8+ high) face brutal multi-street action.
-    // You're drawing 1 while paying double/triple bets each street. Even when you hit,
-    // you've invested too many bets to show a profit.
+    // MULTIWAY DRAWING COST GATE: unchanged — multiway math overwhelms deception
     if (callers >= 2 && triHighVal >= 8)
-      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri can't profitably draw vs ${1 + callers} opponents across 3 streets` };
-    // With 1 caller: 9+ high tris struggle. The extra opponent doubles the per-street cost
-    // of drawing while not improving your completion odds.
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri can't profitably draw vs ${1 + callers} opponents across 3 streets`, mix: { FOLD: 100 } };
     if (callers >= 1 && triHighVal >= 9)
-      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri, drawing cost too high multiway (facing bets from ${1 + callers} each street)` };
+      return { action: "FOLD", color: "#ef4444", detail: `Fold — ${triHighVal}-high tri, drawing cost too high multiway`, mix: { FOLD: 100 } };
 
-    // Standard threshold logic with caller adjustments
     const triCallMax = 8 - Math.floor(triBehind * 0.5) - callers;
     const triMixMax = triCallMax + Math.max(1, 2 - callers);
 
-    if (triHighVal <= 5 && callers === 0)
-      return { action: "3-BET", color: "#22c55e", detail: "Premium tri (draw 1) — 3-bet for value" };
-    if (triHighVal <= 5 && callers >= 1)
-      return { action: "CALL", color: "#3b82f6", detail: `Premium tri — call (3-bet less effective multiway, ${callers} caller${callers > 1 ? "s" : ""})` };
+    // MIXED FREQUENCY STRATEGY (heads-up, no callers):
+    // Premium tris (3-4 high): mostly 3-bet, but call ~25% to protect calling range
+    // 5-high tri: balanced mix — 3-bet 50%, call 50%
+    // 6-high tri: mostly call, 3-bet ~20% for deception
+    // 7-high tri: almost always call, rare 3-bet ~10%
+    // 8+ high: call or fold based on position, no 3-bet
+    if (callers === 0) {
+      if (triHighVal <= 3) {
+        return { action: "3-BET", color: "#22c55e", detail: "Near-nut tri — 3-bet 75%, call 25% (protect calling range)", mix: { "3-BET": 75, CALL: 25 } };
+      }
+      if (triHighVal <= 4) {
+        return { action: "3-BET", color: "#22c55e", detail: "Premium tri — 3-bet 65%, call 35% (balance both ranges)", mix: { "3-BET": 65, CALL: 35 } };
+      }
+      if (triHighVal <= 5) {
+        return { action: "MIX (3-BET/Call)", color: "#a855f7", detail: "Strong tri — 3-bet 45%, call 55% (key mixing hand)", mix: { "3-BET": 45, CALL: 55 } };
+      }
+      if (triHighVal <= 6 && triBehind <= 3) {
+        return { action: "CALL", color: "#3b82f6", detail: "Good tri — call 80%, 3-bet 20% for deception", mix: { "3-BET": 20, CALL: 80 } };
+      }
+      if (triHighVal <= 7 && triBehind <= 2) {
+        return { action: "CALL", color: "#3b82f6", detail: `Decent tri — call 90%, rare 3-bet 10%`, mix: { "3-BET": 10, CALL: 90 } };
+      }
+      if (triHighVal <= triCallMax) {
+        return { action: "CALL", color: "#3b82f6", detail: `Medium tri — call, ${triBehind} behind`, mix: { CALL: 100 } };
+      }
+      if (triHighVal <= triMixMax) {
+        return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Marginal tri — ${triBehind} behind`, mix: { CALL: 50, FOLD: 50 } };
+      }
+      return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold, ${triBehind} behind`, mix: { FOLD: 100 } };
+    }
+
+    // MULTIWAY (1+ callers): 3-betting is less effective (harder to isolate).
+    // Premium tris still 3-bet sometimes to build pot with strong draws.
+    if (triHighVal <= 4) {
+      return { action: "CALL", color: "#3b82f6", detail: `Premium tri — call multiway (3-bet less effective, ${callers} caller${callers > 1 ? "s" : ""})`, mix: { "3-BET": 20, CALL: 80 } };
+    }
+    if (triHighVal <= 5) {
+      return { action: "CALL", color: "#3b82f6", detail: `Strong tri — call, ${callers} caller${callers > 1 ? "s" : ""}`, mix: { CALL: 100 } };
+    }
     if (triHighVal <= triCallMax)
-      return { action: "CALL", color: "#3b82f6", detail: `Good tri — call${callers ? `, tighter w/ ${callers} caller${callers > 1 ? "s" : ""}` : `, ${triBehind} behind`}` };
+      return { action: "CALL", color: "#3b82f6", detail: `Good tri — call${callers ? `, tighter w/ ${callers} caller${callers > 1 ? "s" : ""}` : ""}`, mix: { CALL: 100 } };
     if (triHighVal <= triMixMax)
-      return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Medium tri — ${callers ? `${callers} caller${callers > 1 ? "s" : ""} + ` : ""}${triBehind} behind` };
-    return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold${callers ? `, ${callers} caller${callers > 1 ? "s" : ""} ahead` : `, ${triBehind} behind`}` };
+      return { action: "MIX (Call/Fold)", color: "#fbbf24", detail: `Medium tri — ${callers ? `${callers} caller${callers > 1 ? "s" : ""} + ` : ""}${triBehind} behind`, mix: { CALL: 50, FOLD: 50 } };
+    return { action: "FOLD", color: "#ef4444", detail: `Weak tri — fold${callers ? `, ${callers} caller${callers > 1 ? "s" : ""} ahead` : `, ${triBehind} behind`}`, mix: { FOLD: 100 } };
   }
 
   // Two-card vs single raise: multiway quality gate + threshold adjustments.
@@ -1004,6 +1040,7 @@ function findWorstDefendTri(combos, position, openerPos) {
         combo: ranks, ev: evData.ev,
         bb: toDisplayBB(evData.ev, position),
         action: action.action,
+        mix: action.mix || null,
         label: ranks.join("-") + "r"
       });
     }
@@ -1024,6 +1061,7 @@ function findWorstDefendPat(combos, position, openerPos) {
         combo: ranks, ev: evData.ev,
         bb: toDisplayBB(evData.ev, position),
         action: action.action,
+        mix: action.mix || null,
         label: ranks.join("-") + "r"
       });
     }
@@ -1044,6 +1082,7 @@ function findWorstDefendTwo(combos, position, openerPos) {
         combo: ranks, ev: evData.ev,
         bb: toDisplayBB(evData.ev, position),
         action: action.action,
+        mix: action.mix || null,
         label: ranks.join("-")
       });
     }
@@ -1257,12 +1296,13 @@ function HandDisplay({ cards, small }) {
 // MAIN APP
 // ============================================================
 
-function BadugiSolver() {
+export default function BadugiSolver() {
   const [activeTab, setActiveTab] = useState("flow");
   const [selectedPosition, setSelectedPosition] = useState("BTN");
   const [selectedCategory, setSelectedCategory] = useState("tri");
   const [facingRaise, setFacingRaise] = useState(false);
   const [raiserPosition, setRaiserPosition] = useState("CO");
+  const [expandedColumn, setExpandedColumn] = useState(null); // { category: "tri"|"pat"|"two", high: "5" }
   const [equityHand, setEquityHand] = useState(null);
   const [actionHistory, setActionHistory] = useState([]);
   const [flowCategory, setFlowCategory] = useState("tri");
@@ -1299,6 +1339,227 @@ function BadugiSolver() {
     ];
     return calcEquityVsRange(heroCards, range);
   }, [equityHand]);
+
+  // Render mix frequency display for facing-raise table cells
+  const renderMixBadges = (entry) => {
+    if (!entry || !entry.mix) return null;
+    const mix = entry.mix;
+    const actionColors = {
+      "3-BET": { bg: "#dcfce7", text: "#166534" },
+      "4-BET": { bg: "#f3e8ff", text: "#6b21a8" },
+      "5-BET": { bg: "#fef2f2", text: "#991b1b" },
+      CALL: { bg: "#dbeafe", text: "#1e40af" },
+      FOLD: { bg: "#fef2f2", text: "#991b1b" }
+    };
+    const entries = Object.entries(mix).filter(([_, pct]) => pct > 0);
+    if (entries.length <= 1 && entries[0]?.[1] === 100) {
+      // Pure action — show simple badge
+      const [act] = entries[0];
+      const c = actionColors[act] || { bg: "#f1f5f9", text: "#64748b" };
+      return (
+        <div style={{ fontSize: "9px", fontWeight: 600, marginTop: "2px", padding: "1px 4px", borderRadius: "3px", display: "inline-block", background: c.bg, color: c.text }}>
+          {act}
+        </div>
+      );
+    }
+    // Mixed strategy — show stacked bar + percentages
+    return (
+      <div style={{ marginTop: "3px" }}>
+        <div style={{ display: "flex", height: "6px", borderRadius: "3px", overflow: "hidden", marginBottom: "2px" }}>
+          {entries.map(([act, pct]) => {
+            const c = actionColors[act] || { bg: "#e2e8f0", text: "#64748b" };
+            return <div key={act} style={{ width: `${pct}%`, background: c.text, opacity: 0.7 }} title={`${act}: ${pct}%`} />;
+          })}
+        </div>
+        <div style={{ display: "flex", gap: "3px", justifyContent: "center", flexWrap: "wrap" }}>
+          {entries.map(([act, pct]) => {
+            const c = actionColors[act] || { bg: "#f1f5f9", text: "#64748b" };
+            return (
+              <span key={act} style={{ fontSize: "8px", fontWeight: 700, padding: "0px 3px", borderRadius: "2px", background: c.bg, color: c.text }}>
+                {act} {pct}%
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  // Compute all combos for a given high card, category, and position
+  // isFlowTab: when called from Action Flow, use flow-specific action logic
+  const getAllCombosForColumn = (category, high, pos, isFlowTab, flowContext) => {
+    let combos, makeHand;
+    if (category === "pat") {
+      combos = PAT_RANK_COMBOS[high] || [];
+      makeHand = makeRepresentativePatHand;
+    } else if (category === "tri") {
+      combos = ALL_TRI_COMBOS[high] || [];
+      makeHand = makeRepresentativeTriHand;
+    } else {
+      combos = ALL_TWO_COMBOS[high] || [];
+      makeHand = makeRepresentativeTwoHand;
+    }
+    return combos.map(ranks => {
+      const cards = makeHand(ranks);
+      const evData = calcHandEV(cards, pos);
+      let action;
+      if (isFlowTab && flowContext) {
+        action = flowContext.isRFI
+          ? getPositionActions(pos, evData)
+          : getFacingRaiseActions(pos, flowContext.lastAggressorPos || "UTG", evData, flowContext.betLevel, flowContext.callerCount);
+      } else {
+        action = facingRaise
+          ? getFacingRaiseActions(pos, raiserPosition, evData)
+          : getPositionActions(pos, evData);
+      }
+      return {
+        combo: ranks,
+        ev: evData.ev,
+        bb: toDisplayBB(evData.ev, pos),
+        action: action.action,
+        detail: action.detail || "",
+        mix: action.mix || null,
+        label: ranks.join("-") + (category !== "two" ? "r" : "")
+      };
+    }).sort((a, b) => b.ev - a.ev); // best first
+  };
+
+  // Render expanded column panel showing all combos
+  // flowContext: { isRFI, lastAggressorPos, betLevel, callerCount, nextPos } for Action Flow tab
+  const renderExpandedPanel = (category, flowContext) => {
+    if (!expandedColumn || expandedColumn.category !== category) return null;
+    const high = expandedColumn.high;
+    const isFlowTab = !!flowContext;
+
+    let displayPositions;
+    if (isFlowTab) {
+      displayPositions = flowContext.nextPos ? [flowContext.nextPos] : POSITIONS;
+    } else {
+      const raiserIdx = POSITIONS.indexOf(raiserPosition);
+      displayPositions = facingRaise
+        ? POSITIONS.filter((_, i) => i > raiserIdx)
+        : POSITIONS;
+    }
+
+    const catColors = {
+      pat: { headerBg: "#14532d", headerBorder: "#166534", accent: "#22c55e", lightBg: "#f0fdf4", border: "#bbf7d0" },
+      tri: { headerBg: "#1e293b", headerBorder: "#334155", accent: "#3b82f6", lightBg: "#eff6ff", border: "#bfdbfe" },
+      two: { headerBg: "#3b0764", headerBorder: "#581c87", accent: "#a855f7", lightBg: "#faf5ff", border: "#e9d5ff" }
+    };
+    const colors = catColors[category];
+    const catLabel = category === "pat" ? "Pat" : category === "tri" ? "Tri" : "Two-Card";
+
+    return (
+      <div style={{
+        marginTop: "12px", marginBottom: "16px", borderRadius: "10px",
+        border: `2px solid ${colors.border}`, overflow: "hidden"
+      }}>
+        <div style={{
+          padding: "10px 16px", background: colors.headerBg, color: "#fff",
+          display: "flex", justifyContent: "space-between", alignItems: "center"
+        }}>
+          <span style={{ fontWeight: 800, fontSize: "14px" }}>
+            All {high}-high {catLabel} Combos
+          </span>
+          <button onClick={() => setExpandedColumn(null)} style={{
+            background: "rgba(255,255,255,0.15)", border: "none", color: "#fff",
+            padding: "4px 12px", borderRadius: "4px", cursor: "pointer",
+            fontWeight: 600, fontSize: "11px"
+          }}>
+            Close
+          </button>
+        </div>
+
+        {displayPositions.map(pos => {
+          const allCombos = getAllCombosForColumn(category, high, pos, isFlowTab, flowContext);
+          const opens = allCombos.filter(c => c.action !== "FOLD");
+          const folds = allCombos.filter(c => c.action === "FOLD");
+
+          return (
+            <div key={pos} style={{ borderBottom: `1px solid ${colors.border}` }}>
+              <div style={{
+                padding: "8px 16px", background: colors.lightBg,
+                display: "flex", alignItems: "center", gap: "10px"
+              }}>
+                <span style={{
+                  fontWeight: 800, fontSize: "13px", color: POSITION_COLORS[pos],
+                  minWidth: "32px"
+                }}>
+                  {pos}
+                </span>
+                <span style={{ fontSize: "11px", color: "#64748b" }}>
+                  {isFlowTab
+                    ? (flowContext.isRFI ? "RFI" : `vs ${flowContext.lastAggressorPos} open`)
+                    : (facingRaise ? `vs ${raiserPosition} open` : "RFI")
+                  } — {opens.length} {(isFlowTab ? !flowContext.isRFI : facingRaise) ? "defend" : "open"}, {folds.length} fold of {allCombos.length} combos
+                </span>
+              </div>
+              <div style={{
+                display: "flex", flexWrap: "wrap", gap: "4px",
+                padding: "8px 16px 12px"
+              }}>
+                {allCombos.map((combo, idx) => {
+                  const isFold = combo.action === "FOLD";
+                  const is3bet = ["3-BET","4-BET","5-BET","RAISE"].includes(combo.action);
+                  const isCall = combo.action === "CALL";
+                  const isMix = combo.action.includes("MIX");
+                  const bgColor = isFold ? "#fef2f2" : is3bet ? "#dcfce7" : isCall ? "#dbeafe" : isMix ? "#fef3c7" : "#f1f5f9";
+                  const borderColor = isFold ? "#fecaca" : is3bet ? "#86efac" : isCall ? "#93c5fd" : isMix ? "#fde68a" : "#e2e8f0";
+                  const textColor = isFold ? "#991b1b" : is3bet ? "#166534" : isCall ? "#1e40af" : isMix ? "#92400e" : "#475569";
+
+                  return (
+                    <div key={idx} style={{
+                      padding: "5px 8px", borderRadius: "6px",
+                      background: bgColor, border: `1px solid ${borderColor}`,
+                      minWidth: "80px", textAlign: "center"
+                    }} title={combo.detail}>
+                      <div style={{ fontWeight: 700, fontSize: "11px", color: "#1e293b" }}>
+                        {combo.label}
+                      </div>
+                      <div style={{
+                        fontSize: "11px", fontWeight: 800, marginTop: "1px",
+                        color: combo.bb > 0.05 ? "#16a34a" : combo.bb >= 0 ? "#ca8a04" : "#dc2626"
+                      }}>
+                        {formatBB(combo.bb)} BB
+                      </div>
+                      {(facingRaise || (isFlowTab && !flowContext?.isRFI)) && combo.mix && !isFold ? (
+                        <div style={{ marginTop: "2px" }}>
+                          <div style={{ display: "flex", height: "4px", borderRadius: "2px", overflow: "hidden", marginBottom: "2px" }}>
+                            {Object.entries(combo.mix).filter(([_, p]) => p > 0).map(([act, pct]) => {
+                              const barColor = act.includes("BET") || act === "RAISE" ? "#166534" : act === "CALL" ? "#1e40af" : "#991b1b";
+                              return <div key={act} style={{ width: `${pct}%`, background: barColor, opacity: 0.6 }} />;
+                            })}
+                          </div>
+                          <div style={{ display: "flex", gap: "2px", justifyContent: "center", flexWrap: "wrap" }}>
+                            {Object.entries(combo.mix).filter(([_, p]) => p > 0).map(([act, pct]) => (
+                              <span key={act} style={{
+                                fontSize: "7px", fontWeight: 700, padding: "0 2px", borderRadius: "2px",
+                                background: act.includes("BET") || act === "RAISE" ? "#dcfce7" : act === "CALL" ? "#dbeafe" : "#fef2f2",
+                                color: act.includes("BET") || act === "RAISE" ? "#166534" : act === "CALL" ? "#1e40af" : "#991b1b"
+                              }}>
+                                {act} {pct}%
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div style={{
+                          fontSize: "8px", fontWeight: 700, marginTop: "2px",
+                          color: textColor
+                        }}>
+                          {combo.action}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
 
   const tabStyle = (tab) => ({
     padding: "10px 20px", cursor: "pointer", fontWeight: 600,
@@ -1361,9 +1622,9 @@ function BadugiSolver() {
           <div>
             {/* Category buttons */}
             <div style={{ display: "flex", gap: "8px", marginBottom: "10px", flexWrap: "wrap" }}>
-              <button style={catBtn("pat")} onClick={() => setSelectedCategory("pat")}>Pat Hands (Draw 0)</button>
-              <button style={catBtn("tri")} onClick={() => setSelectedCategory("tri")}>Tri-Cards (Draw 1)</button>
-              <button style={catBtn("two")} onClick={() => setSelectedCategory("two")}>Two-Cards (Draw 2)</button>
+              <button style={catBtn("pat")} onClick={() => { setSelectedCategory("pat"); setExpandedColumn(null); }}>Pat Hands (Draw 0)</button>
+              <button style={catBtn("tri")} onClick={() => { setSelectedCategory("tri"); setExpandedColumn(null); }}>Tri-Cards (Draw 1)</button>
+              <button style={catBtn("two")} onClick={() => { setSelectedCategory("two"); setExpandedColumn(null); }}>Two-Cards (Draw 2)</button>
             </div>
             <div style={{ fontSize: "11px", color: "#64748b", marginBottom: "14px", lineHeight: 1.4, padding: "0 2px" }}>
               {selectedCategory === "tri" && `A hand is only a tri-card if you keep all 3 and draw 1. J-high is the weakest tri — Q/K-high tris break to draw 2 and appear in Two-Cards. Table shows the worst ${facingRaise ? "defending" : "profitable open"} per highest card.`}
@@ -1410,10 +1671,8 @@ function BadugiSolver() {
                   <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                     <span style={{ fontSize: "12px", color: "#92400e", fontWeight: 600 }}>Raiser:</span>
                     {POSITIONS.filter(p => {
-                      // Only show positions that act BEFORE the selected position
-                      const myIdx = POSITIONS.indexOf(selectedPosition);
-                      const theirIdx = POSITIONS.indexOf(p);
-                      return theirIdx < myIdx;
+                      // Any position except BB can open-raise
+                      return p !== "BB";
                     }).map(pos => (
                       <button
                         key={pos}
@@ -1434,6 +1693,7 @@ function BadugiSolver() {
               </div>
             )}
 
+            {/* Helper: render mix frequency badges for facing raise */}
             {/* PAT HAND TABLE — when pat is selected */}
             {selectedCategory === "pat" && (() => {
               const raiserIdx = POSITIONS.indexOf(raiserPosition);
@@ -1467,14 +1727,17 @@ function BadugiSolver() {
                           Position
                         </th>
                         {PAT_HIGH_CARDS.map((high, i) => (
-                          <th key={high} style={{
+                          <th key={high} onClick={() => setExpandedColumn(
+                            expandedColumn?.category === "pat" && expandedColumn?.high === high ? null : { category: "pat", high }
+                          )} style={{
                             padding: "10px 4px", color: "#fff", textAlign: "center",
                             borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #166534" : "none",
-                            minWidth: "72px"
+                            minWidth: "72px", cursor: "pointer",
+                            background: expandedColumn?.category === "pat" && expandedColumn?.high === high ? "#166534" : "inherit"
                           }}>
                             <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
                             <div style={{ fontSize: "9px", color: "#86efac", fontWeight: 500 }}>
-                              ({comboCountRow[i]})
+                              ({comboCountRow[i]}) {expandedColumn?.category === "pat" && expandedColumn?.high === high ? "▼" : "▶"}
                             </div>
                           </th>
                         ))}
@@ -1517,13 +1780,15 @@ function BadugiSolver() {
                                     }}>
                                       {formatBB(entry.bb)} BB
                                     </div>
-                                    <div style={{
-                                      fontSize: "9px", fontWeight: 600, marginTop: "1px",
-                                      padding: "1px 3px", borderRadius: "3px", display: "inline-block",
-                                      background: "#dcfce7", color: "#166534"
-                                    }}>
-                                      {entry.action}
-                                    </div>
+                                    {facingRaise && entry.mix ? renderMixBadges(entry) : (
+                                      <div style={{
+                                        fontSize: "9px", fontWeight: 600, marginTop: "1px",
+                                        padding: "1px 3px", borderRadius: "3px", display: "inline-block",
+                                        background: "#dcfce7", color: "#166534"
+                                      }}>
+                                        {entry.action}
+                                      </div>
+                                    )}
                                   </div>
                                 ) : (
                                   <div style={{ color: "#cbd5e1", fontSize: "10px", fontStyle: "italic" }}>
@@ -1537,6 +1802,8 @@ function BadugiSolver() {
                       ))}
                     </tbody>
                   </table>
+
+                  {renderExpandedPanel("pat")}
 
                   <div style={{
                     marginTop: "12px", padding: "10px 14px", background: "#f0fdf4",
@@ -1587,14 +1854,17 @@ function BadugiSolver() {
                           Position
                         </th>
                         {TRI_HIGH_CARDS.map((high, i) => (
-                          <th key={high} style={{
+                          <th key={high} onClick={() => setExpandedColumn(
+                            expandedColumn?.category === "tri" && expandedColumn?.high === high ? null : { category: "tri", high }
+                          )} style={{
                             padding: "10px 6px", color: "#fff", textAlign: "center",
                             borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #334155" : "none",
-                            minWidth: "80px"
+                            minWidth: "80px", cursor: "pointer",
+                            background: expandedColumn?.category === "tri" && expandedColumn?.high === high ? "#334155" : "inherit"
                           }}>
                             <div style={{ fontSize: "16px", fontWeight: 800 }}>{high}</div>
                             <div style={{ fontSize: "10px", color: "#94a3b8", fontWeight: 500 }}>
-                              ({comboCountRow[i]} combos)
+                              ({comboCountRow[i]} combos) {expandedColumn?.category === "tri" && expandedColumn?.high === high ? "▼" : "▶"}
                             </div>
                           </th>
                         ))}
@@ -1640,16 +1910,18 @@ function BadugiSolver() {
                                     }}>
                                       {formatBB(entry.bb)} BB
                                     </div>
-                                    <div style={{
-                                      fontSize: "9px", fontWeight: 600, marginTop: "2px",
-                                      padding: "1px 4px", borderRadius: "3px", display: "inline-block",
-                                      background: entry.action.includes("MIX") ? "#fef3c7"
-                                        : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
-                                      color: entry.action.includes("MIX") ? "#92400e"
-                                        : entry.action === "RAISE" ? "#166534" : "#1e40af"
-                                    }}>
-                                      {entry.action}
-                                    </div>
+                                    {facingRaise && entry.mix ? renderMixBadges(entry) : (
+                                      <div style={{
+                                        fontSize: "9px", fontWeight: 600, marginTop: "2px",
+                                        padding: "1px 4px", borderRadius: "3px", display: "inline-block",
+                                        background: entry.action.includes("MIX") ? "#fef3c7"
+                                          : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
+                                        color: entry.action.includes("MIX") ? "#92400e"
+                                          : entry.action === "RAISE" ? "#166534" : "#1e40af"
+                                      }}>
+                                        {entry.action}
+                                      </div>
+                                    )}
                                   </div>
                                 ) : (
                                   <div style={{ color: "#cbd5e1", fontSize: "11px", fontStyle: "italic" }}>
@@ -1664,6 +1936,8 @@ function BadugiSolver() {
                     </tbody>
                   </table>
 
+                  {renderExpandedPanel("tri")}
+
                   {/* Legend */}
                   <div style={{
                     marginTop: "12px", padding: "10px 14px", background: "#f8fafc",
@@ -1672,7 +1946,7 @@ function BadugiSolver() {
                     fontSize: "11px", color: "#64748b"
                   }}>
                     <span style={{ fontWeight: 700, color: "#475569" }}>Reading the table:</span>
-                    <span>Each cell shows the <strong>worst</strong> rank combo that's still a profitable open from that position.</span>
+                    <span>Each cell shows the <strong>worst</strong> rank combo that's still a profitable open from that position. Click a column header to see all combos.</span>
                     <span>If a cell shows A-2-7r from UTG under the "7" column, that means A-2-7r is the weakest 7-high tri that UTG opens.</span>
                   </div>
                 </div>
@@ -1712,14 +1986,17 @@ function BadugiSolver() {
                           Position
                         </th>
                         {TWO_HIGH_CARDS.map((high, i) => (
-                          <th key={high} style={{
+                          <th key={high} onClick={() => setExpandedColumn(
+                            expandedColumn?.category === "two" && expandedColumn?.high === high ? null : { category: "two", high }
+                          )} style={{
                             padding: "10px 6px", color: "#fff", textAlign: "center",
                             borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #581c87" : "none",
-                            minWidth: "80px"
+                            minWidth: "80px", cursor: "pointer",
+                            background: expandedColumn?.category === "two" && expandedColumn?.high === high ? "#581c87" : "inherit"
                           }}>
                             <div style={{ fontSize: "16px", fontWeight: 800 }}>{high}</div>
                             <div style={{ fontSize: "10px", color: "#c4b5fd", fontWeight: 500 }}>
-                              ({comboCountRow[i]} {comboCountRow[i] === 1 ? "base" : "bases"})
+                              ({comboCountRow[i]} {comboCountRow[i] === 1 ? "base" : "bases"}) {expandedColumn?.category === "two" && expandedColumn?.high === high ? "▼" : "▶"}
                             </div>
                           </th>
                         ))}
@@ -1764,16 +2041,18 @@ function BadugiSolver() {
                                     }}>
                                       {formatBB(entry.bb)} BB
                                     </div>
-                                    <div style={{
-                                      fontSize: "9px", fontWeight: 600, marginTop: "2px",
-                                      padding: "1px 4px", borderRadius: "3px", display: "inline-block",
-                                      background: entry.action.includes("MIX") ? "#fef3c7"
-                                        : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
-                                      color: entry.action.includes("MIX") ? "#92400e"
-                                        : entry.action === "RAISE" ? "#166534" : "#1e40af"
-                                    }}>
-                                      {entry.action}
-                                    </div>
+                                    {facingRaise && entry.mix ? renderMixBadges(entry) : (
+                                      <div style={{
+                                        fontSize: "9px", fontWeight: 600, marginTop: "2px",
+                                        padding: "1px 4px", borderRadius: "3px", display: "inline-block",
+                                        background: entry.action.includes("MIX") ? "#fef3c7"
+                                          : entry.action === "RAISE" ? "#dcfce7" : "#dbeafe",
+                                        color: entry.action.includes("MIX") ? "#92400e"
+                                          : entry.action === "RAISE" ? "#166534" : "#1e40af"
+                                      }}>
+                                        {entry.action}
+                                      </div>
+                                    )}
                                   </div>
                                 ) : (
                                   <div style={{ color: "#cbd5e1", fontSize: "11px", fontStyle: "italic" }}>
@@ -1787,6 +2066,8 @@ function BadugiSolver() {
                       ))}
                     </tbody>
                   </table>
+
+                  {renderExpandedPanel("two")}
 
                   <div style={{
                     marginTop: "12px", padding: "10px 14px", background: "#f5f3ff",
@@ -2096,6 +2377,7 @@ function BadugiSolver() {
                     const tableData = getFlowTableData("tri", TRI_HIGH_CARDS, TRI_RANK_COMBOS, makeRepresentativeTriHand);
                     if (!tableData) return null;
                     const comboCountRow = TRI_HIGH_CARDS.map(h => TRI_RANK_COMBOS[h].length);
+                    const flowCtx = { isRFI, lastAggressorPos: lastAggressor?.pos || "UTG", betLevel, callerCount, nextPos };
                     return (
                       <div style={{ overflowX: "auto", marginBottom: "16px" }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
@@ -2105,9 +2387,11 @@ function BadugiSolver() {
                                 {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
                               </th>
                               {TRI_HIGH_CARDS.map((high, i) => (
-                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #334155" : "none", minWidth: "72px" }}>
+                                <th key={high} onClick={() => setExpandedColumn(
+                                  expandedColumn?.category === "tri" && expandedColumn?.high === high ? null : { category: "tri", high }
+                                )} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", cursor: "pointer", borderRight: i < TRI_HIGH_CARDS.length - 1 ? "1px solid #334155" : "none", minWidth: "72px", background: expandedColumn?.category === "tri" && expandedColumn?.high === high ? "#334155" : "inherit" }}>
                                   <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
-                                  <div style={{ fontSize: "9px", color: "#94a3b8" }}>({comboCountRow[i]})</div>
+                                  <div style={{ fontSize: "9px", color: "#94a3b8" }}>({comboCountRow[i]}) {expandedColumn?.category === "tri" && expandedColumn?.high === high ? "▼" : "▶"}</div>
                                 </th>
                               ))}
                             </tr>
@@ -2150,6 +2434,7 @@ function BadugiSolver() {
                             </tr>
                           </tbody>
                         </table>
+                        {renderExpandedPanel("tri", flowCtx)}
                       </div>
                     );
                   })()}
@@ -2158,6 +2443,7 @@ function BadugiSolver() {
                     const tableData = getFlowTableData("pat", PAT_HIGH_CARDS, PAT_RANK_COMBOS, makeRepresentativePatHand);
                     if (!tableData) return null;
                     const comboCountRow = PAT_HIGH_CARDS.map(h => PAT_RANK_COMBOS[h].length);
+                    const flowCtx = { isRFI, lastAggressorPos: lastAggressor?.pos || "UTG", betLevel, callerCount, nextPos };
                     return (
                       <div style={{ overflowX: "auto", marginBottom: "16px" }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
@@ -2167,9 +2453,11 @@ function BadugiSolver() {
                                 {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
                               </th>
                               {PAT_HIGH_CARDS.map((high, i) => (
-                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #166534" : "none", minWidth: "66px" }}>
+                                <th key={high} onClick={() => setExpandedColumn(
+                                  expandedColumn?.category === "pat" && expandedColumn?.high === high ? null : { category: "pat", high }
+                                )} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", cursor: "pointer", borderRight: i < PAT_HIGH_CARDS.length - 1 ? "1px solid #166534" : "none", minWidth: "66px", background: expandedColumn?.category === "pat" && expandedColumn?.high === high ? "#166534" : "inherit" }}>
                                   <div style={{ fontSize: "14px", fontWeight: 800 }}>{high}</div>
-                                  <div style={{ fontSize: "9px", color: "#86efac" }}>({comboCountRow[i]})</div>
+                                  <div style={{ fontSize: "9px", color: "#86efac" }}>({comboCountRow[i]}) {expandedColumn?.category === "pat" && expandedColumn?.high === high ? "▼" : "▶"}</div>
                                 </th>
                               ))}
                             </tr>
@@ -2212,6 +2500,7 @@ function BadugiSolver() {
                             </tr>
                           </tbody>
                         </table>
+                        {renderExpandedPanel("pat", flowCtx)}
                       </div>
                     );
                   })()}
@@ -2220,6 +2509,7 @@ function BadugiSolver() {
                     const tableData = getFlowTableData("two", TWO_HIGH_CARDS, TWO_RANK_COMBOS, makeRepresentativeTwoHand);
                     if (!tableData) return null;
                     const comboCountRow = TWO_HIGH_CARDS.map(h => TWO_RANK_COMBOS[h].length);
+                    const flowCtx = { isRFI, lastAggressorPos: lastAggressor?.pos || "UTG", betLevel, callerCount, nextPos };
                     return (
                       <div style={{ overflowX: "auto", marginBottom: "16px" }}>
                         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", border: "1px solid #e2e8f0" }}>
@@ -2229,9 +2519,11 @@ function BadugiSolver() {
                                 {nextPos} {isRFI ? "RFI" : `vs ${lastAggressor?.pos}`}
                               </th>
                               {TWO_HIGH_CARDS.map((high, i) => (
-                                <th key={high} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #581c87" : "none", minWidth: "72px" }}>
+                                <th key={high} onClick={() => setExpandedColumn(
+                                  expandedColumn?.category === "two" && expandedColumn?.high === high ? null : { category: "two", high }
+                                )} style={{ padding: "8px 4px", color: "#fff", textAlign: "center", cursor: "pointer", borderRight: i < TWO_HIGH_CARDS.length - 1 ? "1px solid #581c87" : "none", minWidth: "72px", background: expandedColumn?.category === "two" && expandedColumn?.high === high ? "#581c87" : "inherit" }}>
                                   <div style={{ fontSize: "15px", fontWeight: 800 }}>{high}</div>
-                                  <div style={{ fontSize: "9px", color: "#c4b5fd" }}>({comboCountRow[i]})</div>
+                                  <div style={{ fontSize: "9px", color: "#c4b5fd" }}>({comboCountRow[i]}) {expandedColumn?.category === "two" && expandedColumn?.high === high ? "▼" : "▶"}</div>
                                 </th>
                               ))}
                             </tr>
@@ -2273,6 +2565,7 @@ function BadugiSolver() {
                             </tr>
                           </tbody>
                         </table>
+                        {renderExpandedPanel("two", flowCtx)}
                       </div>
                     );
                   })()}
@@ -2790,7 +3083,7 @@ function BadugiSolver() {
   );
 }
 
-    const root = ReactDOM.createRoot(document.getElementById('root'));
+    const root = ReactDOM.createRoot(document.getElementById("root"));
     root.render(React.createElement(BadugiSolver));
   </script>
 </body>
